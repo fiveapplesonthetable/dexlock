@@ -2,8 +2,8 @@
 //!
 //! Given monitor-contention observations (each naming two `File:line` source
 //! sites) and the DEX artifacts for the build they came from, dexlock resolves
-//! each site to the canonical lock taken there, using the lockdex analyzer as a
-//! library (in-process, no subprocess round-trip).
+//! each site to the canonical lock taken there. The DEX analysis runs in-process
+//! (see [`dex`]) — no subprocess per query.
 //!
 //! The moving parts are pluggable seams:
 //! - [`traces::TraceSource`] — where observations come from (a CSV file ships;
@@ -14,6 +14,7 @@
 
 pub mod artifact;
 pub mod csv_io;
+pub mod dex;
 pub mod model;
 pub mod pipeline;
 pub mod resolver;

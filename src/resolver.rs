@@ -1,23 +1,21 @@
 //! The resolver: turn contention source sites into canonical locks.
 //!
-//! Resolution runs entirely in-process against the lockdex library — there is no
-//! `lockdex index` / `lockdex query` subprocess and no on-the-wire index file per
-//! query. For a build, the expensive step (parse the DEX, run the lock analysis)
-//! is done once, its site→lock projection is cached to disk, and then every site
-//! is answered from an in-memory lookup. Re-runs against the same build skip the
-//! analysis entirely and load the cached projection in milliseconds.
+//! Resolution runs entirely in-process — there is no per-query subprocess and no
+//! on-the-wire index file. For a build, the expensive step (parse the DEX, run the
+//! lock analysis in [`crate::dex`]) is done once, its site→lock projection is
+//! cached to disk, and then every site is answered from an in-memory lookup.
+//! Re-runs against the same build skip the analysis entirely and load the cached
+//! projection in milliseconds.
 
+use crate::dex::{self, input, resolve::ResolveIndex};
 use crate::site;
 use anyhow::{Context, Result};
-use lockdex::juc::AsyncConfig;
-use lockdex::resolve::ResolveIndex;
-use lockdex::{analyze, input};
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// How to resolve: line-drift tolerance and the "sole lock in the file" fallback,
-/// mirroring lockdex's own resolution knobs. Defaults to exact-line, no fallback.
+/// How to resolve: line-drift tolerance and the "sole lock in the file" fallback.
+/// Defaults to exact-line, no fallback.
 #[derive(Clone, Copy, Default)]
 pub struct Options {
     /// Snap to the nearest monitor-enter within this many lines (0 = exact only).
@@ -89,14 +87,13 @@ impl Resolver {
 }
 
 /// Analyze a directory (or single jar/apk) and project it to a site→lock index.
-/// This is the one place the DEX front-end runs; `parse_all` shells out to
-/// `dexdump` (point `$LOCKDEX_DEXDUMP` at it, or have it on `PATH`).
+/// This is the one place the DEX front-end runs; parsing shells out to `dexdump`
+/// (point `$DEXLOCK_DEXDUMP` at it, or have it on `PATH`).
 pub fn build_index(artifact: &Path, scope: Option<&str>) -> Result<ResolveIndex> {
     let set = input::resolve(artifact, scope)
         .with_context(|| format!("locating dex in {}", artifact.display()))?;
-    let dex = input::parse_all(&set).context("parsing dex (is dexdump available?)")?;
-    let analysis = analyze::analyze(&dex, &AsyncConfig::default());
-    Ok(ResolveIndex::from_acquisitions(&analysis.acquisitions))
+    let parsed = input::parse_all(&set).context("parsing dex (is dexdump available?)")?;
+    Ok(ResolveIndex::from_acquisitions(&dex::acquisitions(&parsed)))
 }
 
 /// Make a build id safe as a filename.

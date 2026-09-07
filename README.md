@@ -7,10 +7,10 @@ Input is a table of contention observations — each naming two `File.java:line`
 sites (the thread that was blocked and the thread that held the lock) and the build
 they came from. Output is the same table with two columns added: the canonical lock
 for each site. dexlock groups observations by build, obtains that build's DEX
-artifacts, analyzes them once with [lockdex](https://github.com/fiveapplesonthetable/lockdex)
-as a library, and answers every site from an in-memory index. There is no
-subprocess per query and no external service dependency; where artifacts and
-observations come from are pluggable interfaces.
+artifacts, analyzes them once with its in-process analyzer (`src/dex`), and answers
+every site from an in-memory index. There is no subprocess per query and no external
+service dependency; where artifacts and observations come from are pluggable
+interfaces.
 
 ## What "resolving a site" means
 
@@ -27,10 +27,10 @@ its lock through a builder resolves to the single field that actually owns the l
 (`com.example.Service.mProcLock`), even though the lock reaches that site through a
 builder field that was assigned the service's lock.
 
-## How resolution works (the lockdex analysis)
+## How resolution works
 
-Resolution is bytecode dataflow, not text matching or naming heuristics. dexlock
-drives lockdex's analyzer; the algorithm it runs, per build:
+Resolution is bytecode dataflow, not text matching or naming heuristics. The
+analyzer in `src/dex` runs, per build:
 
 1. **Decode.** Each `classes*.dex` is disassembled (via `dexdump`) into an
    instruction model: monitor-enter/exit, field loads/stores (`iget`/`iput`/`sget`),
@@ -81,8 +81,8 @@ present in the analyzed artifacts) is left unresolved rather than guessed.
 
 ## The index and the lookup
 
-Resolving a site reads only the set of monitor-enter sites — never the full lock
-graph. lockdex projects the analysis to a `ResolveIndex`: one record per site,
+Resolving a site reads only the set of monitor-enter sites. The analyzer projects
+its result to a `ResolveIndex`: one record per site,
 `{ source_file, holder_method, line, canonical_lock }`. dexlock:
 
 - **Caches** that projection to `cache/<build_id>.idx.json`. The expensive step
@@ -236,16 +236,10 @@ pipeline::run(rows, &DirArtifactProvider { root: "jars".into() }, &resolver, &he
 cargo build --release
 ```
 
-dexlock depends on `lockdex` as a git dependency. For local development against a
-`lockdex` checkout, add a gitignored `.cargo/config.toml`:
-
-```toml
-paths = ["/path/to/lockdex"]
-```
-
-`lockdex` decodes DEX by shelling out to `dexdump` during the analysis step (the only
-external process, and only on a cache miss). Point `$LOCKDEX_DEXDUMP` at it or pass
-`--dexdump`; otherwise it must be on `PATH`.
+No external service or crate beyond the published dependencies — the DEX analyzer is
+in-tree under `src/dex`. The one external process is `dexdump`, invoked during the
+analysis step (and only on a cache miss) to decode bytecode. Point `$DEXLOCK_DEXDUMP`
+at it or pass `--dexdump`; otherwise it must be on `PATH`.
 
 ## Tests
 

@@ -1,7 +1,5 @@
 /target
 Cargo.lock
-# Local source override for the lockdex dependency (points at a checkout on disk).
-/.cargo/config.toml
 # Local caches / scratch.
 /*.csv
 /cache/

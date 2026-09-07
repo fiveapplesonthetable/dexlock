@@ -56,7 +56,7 @@ struct Args {
     #[arg(long)]
     compact_counts: bool,
 
-    /// Path to `dexdump` (else `$LOCKDEX_DEXDUMP`, else `PATH`).
+    /// Path to `dexdump` (else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
 }
@@ -68,7 +68,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if let Some(d) = &args.dexdump {
-        std::env::set_var("LOCKDEX_DEXDUMP", d);
+        std::env::set_var("DEXLOCK_DEXDUMP", d);
     }
 
     let rows = CsvTraceSource { path: args.input.clone() }.fetch(&Query::default())?;

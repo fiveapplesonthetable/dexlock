@@ -16,10 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 zip = "2"
-# The DEX lock analyzer. Resolution runs in-process against its library API — no
-# subprocess round-trip. For local development, override the source to a checkout
-# via a gitignored `.cargo/config.toml` (`paths = ["/path/to/lockdex"]`).
-lockdex = { git = "https://github.com/fiveapplesonthetable/lockdex", branch = "master" }
 
 [profile.release]
 lto = "thin"
