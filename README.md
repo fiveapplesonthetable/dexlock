@@ -1,0 +1,258 @@
+# dexlock
+
+Resolve monitor-contention source sites to the canonical lock taken at each one,
+by static analysis of DEX bytecode.
+
+Input is a table of contention observations — each naming two `File.java:line`
+sites (the thread that was blocked and the thread that held the lock) and the build
+they came from. Output is the same table with two columns added: the canonical lock
+for each site. dexlock groups observations by build, obtains that build's DEX
+artifacts, analyzes them once with [lockdex](https://github.com/fiveapplesonthetable/lockdex)
+as a library, and answers every site from an in-memory index. There is no
+subprocess per query and no external service dependency; where artifacts and
+observations come from are pluggable interfaces.
+
+## What "resolving a site" means
+
+A monitor-contention record tells you *where* a thread blocked (`Foo.java:1234`) but
+not *which lock* it blocked on. Two different fields synchronized on nearby lines are
+indistinguishable by source location, and the same lock is reached under many names
+(`this`, `mLock`, `svc.getLock()`, an injected constructor argument, a field that
+merely holds another object's lock). Resolution maps a site to one canonical lock
+identity so that contention on the *same* lock through *different* code paths
+aggregates together.
+
+Example: a site sitting on `synchronized (mProcLock)` inside a class that received
+its lock through a builder resolves to the single field that actually owns the lock
+(`com.example.Service.mProcLock`), even though the lock reaches that site through a
+builder field that was assigned the service's lock.
+
+## How resolution works (the lockdex analysis)
+
+Resolution is bytecode dataflow, not text matching or naming heuristics. dexlock
+drives lockdex's analyzer; the algorithm it runs, per build:
+
+1. **Decode.** Each `classes*.dex` is disassembled (via `dexdump`) into an
+   instruction model: monitor-enter/exit, field loads/stores (`iget`/`iput`/`sget`),
+   moves, invokes, allocations, returns, branches.
+
+2. **Per-method abstract interpretation.** Each method is summarized by tracking an
+   abstract *lock value* per register. When a `monitor-enter v` is seen, register `v`
+   is traced back to its definition — `iget` (a field, including an outer class's
+   `this$0` field), `sget` (a static), `move`/`move-result` (a local alias or a
+   getter's return), `check-cast`, `new-instance` — yielding a structured identity
+   rather than a register number.
+
+3. **Lock identity = root + bounded access path.** A lock is a `Root` plus a list of
+   field hops:
+   - `Root ∈ { This, Param(i), Recv(class), Static(field), ClassConst, Alloc(site), Opaque }`.
+   - `This`/`Param(i)` are *parametric* — valid only inside a method summary — and are
+     substituted at call sites. `Recv`/`Static` are grounded, program-wide identities.
+   - The access path is capped at a small length *k* (RacerD-style). A path that grows
+     past *k* truncates to a distinct opaque, which bounds the analysis lattice and
+     keeps two unrelated deep paths from colliding. Real `synchronized` operands are
+     0–2 hops, so the cap costs no precision in practice.
+
+4. **Interprocedural propagation as a monotone fixpoint.** Parametric roots are
+   resolved across the call graph by parameter/copy propagation, solved as a Kleene
+   least fixpoint over the meet-semilattice `Bottom < Val(lock) < Top`:
+   - A formal parameter's value is the *meet* of the actual arguments bound at every
+     observed call site. A conflict, or an argument that does not resolve to a single
+     object, yields `Top` (unresolved) rather than a wrong merge.
+   - `this.field = param` (in a constructor, a setter, or a `super(...)` call — all
+     just call sites) makes the field an alias of that formal, resolved to the concrete
+     object passed in. Constructor injection, setter injection, and inheritance
+     threading fall out of the one algorithm with no special cases.
+   - **Must-alias for allocations.** Once a freshly allocated object is stored into
+     `this.field`, that register *is* `this.field`; it is renamed accordingly, so a
+     later use of the same register (including the register an optimizer forwards
+     straight into a setter instead of reloading with an `iget`) carries the field
+     identity and grounds correctly.
+
+5. **Canonicalization.** A field that holds a reference to another object's lock is
+   followed to that object; the alias map is chased transitively so
+   `A.mProcLock → Builder.mProcLock → Service.mProcLock` collapses to the root. A
+   singleton object stored in exactly one field and locked via `synchronized(this)`
+   internally is unified with `owner.field` externally.
+
+The result is a real definition or nothing: a site whose lock genuinely escapes the
+analysis (a per-call allocation, a collection element, an object from a call site not
+present in the analyzed artifacts) is left unresolved rather than guessed.
+
+## The index and the lookup
+
+Resolving a site reads only the set of monitor-enter sites — never the full lock
+graph. lockdex projects the analysis to a `ResolveIndex`: one record per site,
+`{ source_file, holder_method, line, canonical_lock }`. dexlock:
+
+- **Caches** that projection to `cache/<build_id>.idx.json`. The expensive step
+  (decode + fixpoint) runs once per build; a subsequent run loads the projection
+  (milliseconds) and skips analysis entirely.
+- **Buckets** sites by source-file basename, so a query scans one file's records
+  rather than the whole program.
+- **Answers** each query by: exact line match; else, with `--fuzz N`, the nearest
+  monitor-enter within `N` lines (recovering from line drift between the trace's build
+  and the analyzed build); else, with `--if-unique`, the file's sole lock when
+  unambiguous. Per-site lookup is a hash-bucket probe.
+
+Queries within a build are resolved in parallel. Because the lookup is a bucketed
+map probe (constant work per site), a build with a handful of distinct sites and one
+with millions cost about the same beyond the one-time analysis.
+
+## Pipeline
+
+```
+observations (CSV)
+      │  group by (build_id, device), largest group first
+      ▼
+for each build:
+   ArtifactProvider.artifacts(build)     → directory of .jar/.apk
+   Resolver.index_for(build)             → ResolveIndex   (disk-cached; analyze once)
+   Resolver.resolve(index, sites)        → site → canonical lock   (parallel)
+      │  write output after each build (progressive)
+      ▼
+resolved table (CSV), or a compacted aggregate keyed by the structural columns
+```
+
+## Pluggable interfaces
+
+Everything environment-specific is behind a trait; the shipped implementations are
+generic and depend on nothing but the filesystem.
+
+- `TraceSource` — where observations come from. `CsvTraceSource` reads a table from a
+  CSV file; `MockTraceSource` generates synthetic rows. Implement it to query your own
+  trace store or endpoint.
+- `ArtifactProvider` — where a build's jars/apks come from. `DirArtifactProvider` uses
+  a directory already on disk (flat, or a `<build_id>/` subdirectory per build);
+  `ZipArtifactProvider` unpacks `<build_id>.zip` in-process (parallel extraction, no
+  `unzip` subprocess) and reuses already-unpacked builds; `MockArtifactProvider`
+  returns a fixed directory. Implement it to download from your own build store.
+
+## Integrating your environment
+
+The two seams isolate everything specific to your setup. The core (grouping, index
+build, disk cache, lookup, CSV I/O) needs no changes; you provide how observations
+and artifacts are obtained.
+
+**Artifact download seam.** Fetch a build's binaries however your infrastructure
+exposes them, lay the DEX-bearing files (`.jar` / `.apk`) into a directory, and return
+it. Cache by build so a build is fetched once.
+
+```rust
+use anyhow::Result;
+use dexlock::artifact::ArtifactProvider;
+use std::path::PathBuf;
+
+struct MyDownloader { cache_root: PathBuf }
+
+impl ArtifactProvider for MyDownloader {
+    fn artifacts(&self, build_id: &str, device: &str) -> Result<PathBuf> {
+        let dir = self.cache_root.join(build_id);
+        if dir.is_dir() { return Ok(dir); }              // already fetched
+        std::fs::create_dir_all(&dir)?;
+        // 1. resolve build_id/device to a downloadable artifact via your API
+        // 2. download it (parallelise for speed)
+        // 3. unpack the .jar/.apk (and, if needed, any container archives) into `dir`
+        //    — reuse dexlock's in-process unpacker or your own
+        Ok(dir)
+    }
+}
+```
+
+`ArtifactProvider` requires `Sync` so builds can be processed without shared-state
+hazards; keep the implementation stateless or use interior locking. The resolver only
+needs the directory to contain jars/apks whose entries include `classes*.dex`.
+
+**Trace/query seam.** Return the batch of observations from wherever they live — a
+CSV export (shipped), a database query, an HTTP endpoint. Populate the six required
+fields; the raw record is preserved for round-tripping other columns.
+
+```rust
+use anyhow::Result;
+use dexlock::model::{Contention, Query};
+use dexlock::traces::TraceSource;
+
+struct MyTraceStore { /* client/handles */ }
+
+impl TraceSource for MyTraceStore {
+    fn fetch(&self, q: &Query) -> Result<Vec<Contention>> {
+        // run your query (respect q.limit / q.last_days / q.build_id / q.device),
+        // map each result row into a Contention { build_id, device, blocked_src,
+        // blocking_src, short_blocked_method, short_blocking_method, raw, .. }
+        Ok(vec![])
+    }
+}
+```
+
+Then drive the same pipeline with your implementations:
+
+```rust
+let rows = MyTraceStore { /* .. */ }.fetch(&Query { limit: 1000, last_days: 30, ..Default::default() })?;
+let provider = MyDownloader { cache_root: "cache/artifacts".into() };
+let resolver = Resolver::new("cache/index".into(), None, Options::default());
+pipeline::run(rows, &provider, &resolver, &headers, &Output { path: "out.csv".into(), compact: false })?;
+```
+
+Nothing in the core assumes any particular build server, trace store, or artifact
+format beyond "a directory of jars/apks" and "rows with the six fields." Swap the two
+implementations and the resolver, cache, and lookup are unchanged.
+
+## CLI
+
+```sh
+dexlock \
+  --input contention.csv \
+  --artifacts ./jars \        # dir of jars/apks, or a parent with <build_id>/ subdirs
+  --output resolved.csv \
+  --cache-dir ./cache         # per-build indexes cached here
+# options: --zip (artifacts are <build_id>.zip), --fuzz N, --if-unique,
+#          --compact-counts, --scope <substr>, --dexdump <path>
+```
+
+Input columns required: `build_id`, `device_name`, `blocked_src`, `blocking_src`,
+`short_blocked_method`, `short_blocking_method`. Any other columns are preserved.
+`--compact-counts` emits `(resolved_blocked_lock, resolved_blocking_lock,
+short_blocked_method, short_blocking_method, traces)` sorted by count.
+
+## Library
+
+```rust
+use dexlock::artifact::DirArtifactProvider;
+use dexlock::resolver::{Options, Resolver};
+use dexlock::{csv_io, pipeline, pipeline::Output, traces::{CsvTraceSource, TraceSource}, model::Query};
+
+let rows = CsvTraceSource { path: "in.csv".into() }.fetch(&Query::default())?;
+let headers = csv_io::load("in.csv".as_ref())?.headers;
+let resolver = Resolver::new("cache".into(), None, Options::default());
+pipeline::run(rows, &DirArtifactProvider { root: "jars".into() }, &resolver, &headers,
+              &Output { path: "out.csv".into(), compact: false })?;
+```
+
+`Resolver::index_for` / `Resolver::resolve` are usable directly for non-CSV flows.
+
+## Building
+
+```sh
+cargo build --release
+```
+
+dexlock depends on `lockdex` as a git dependency. For local development against a
+`lockdex` checkout, add a gitignored `.cargo/config.toml`:
+
+```toml
+paths = ["/path/to/lockdex"]
+```
+
+`lockdex` decodes DEX by shelling out to `dexdump` during the analysis step (the only
+external process, and only on a cache miss). Point `$LOCKDEX_DEXDUMP` at it or pass
+`--dexdump`; otherwise it must be on `PATH`.
+
+## Tests
+
+```sh
+cargo test
+```
+
+The tests are self-contained: they seed a cached index (the resolver's on-disk shape)
+and exercise the full load → group → resolve → save path in-process, with no DEX
+toolchain, network, or external service.

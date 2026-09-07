@@ -1,0 +1,26 @@
+[package]
+name = "dexlock"
+version = "0.1.0"
+edition = "2021"
+description = "Fast lock-contention resolver: maps monitor-contention source sites to their canonical locks by analyzing DEX bytecode."
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+csv = "1"
+log = "0.4"
+env_logger = "0.11"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"
+zip = "2"
+# The DEX lock analyzer. Resolution runs in-process against its library API — no
+# subprocess round-trip. For local development, override the source to a checkout
+# via a gitignored `.cargo/config.toml` (`paths = ["/path/to/lockdex"]`).
+lockdex = { git = "https://github.com/fiveapplesonthetable/lockdex", branch = "master" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
