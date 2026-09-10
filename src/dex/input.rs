@@ -23,7 +23,6 @@
 //! Multiple dexes are parsed in parallel and merged into one `Dex` so the call
 //! graph resolves across dex boundaries.
 
-use crate::dex::dexdump;
 use crate::dex::model::Dex;
 use anyhow::{Context, Result};
 use rayon::prelude::*;
@@ -184,7 +183,7 @@ pub fn parse_inputs(paths: &[PathBuf], scope: Option<&str>) -> Result<Dex> {
         anyhow::bail!("no dex files found in the given inputs");
     }
     let parsed: Vec<Dex> =
-        files.par_iter().map(|p| dexdump::parse_dex(p)).collect::<Result<Vec<_>>>()?;
+        files.par_iter().map(|p| crate::dex::parse_dex(p)).collect::<Result<Vec<_>>>()?;
     Ok(merge_dexes(parsed))
 }
 
@@ -196,7 +195,7 @@ pub fn parse_all(set: &DexSet) -> Result<Dex> {
     let parsed: Vec<Dex> = set
         .files
         .par_iter()
-        .map(|p| dexdump::parse_dex(p))
+        .map(|p| crate::dex::parse_dex(p))
         .collect::<Result<Vec<_>>>()?;
     Ok(merge_dexes(parsed))
 }

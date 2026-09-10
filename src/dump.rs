@@ -82,12 +82,14 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
     Ok(n)
 }
 
-/// Stream a JSON array of `{class, method, line, lock}` without a second copy.
+/// Stream a JSON array of `{class, method, file, line, lock}` without a second copy.
+/// `file`+`line` are the `File.java:line` a monitor-contention record names.
 fn write_json(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
     #[derive(serde::Serialize)]
     struct Row<'a> {
         class: &'a str,
         method: &'a str,
+        file: Option<&'a str>,
         line: Option<u32>,
         lock: &'a str,
     }
@@ -99,6 +101,7 @@ fn write_json(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
         let row = Row {
             class: &a.class,
             method: &a.method,
+            file: a.source_file.as_deref(),
             line: a.line,
             lock: &a.lock,
         };
@@ -111,18 +114,20 @@ fn write_json(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
 /// Intern all names into a pool and emit the columnar `LockPoints` protobuf.
 fn write_proto(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
     let mut pool = Pool::default();
+    pool.intern(""); // id 0 = "" so an absent file/name is a stable sentinel
     let mut class_id = Vec::with_capacity(acqs.len());
     let mut method_id = Vec::with_capacity(acqs.len());
+    let mut file_id = Vec::with_capacity(acqs.len());
     let mut lock_id = Vec::with_capacity(acqs.len());
     let mut line = Vec::with_capacity(acqs.len());
     for a in acqs {
         class_id.push(pool.intern(&a.class));
         method_id.push(pool.intern(&a.method));
+        file_id.push(pool.intern(a.source_file.as_deref().unwrap_or("")));
         lock_id.push(pool.intern(&a.lock));
         line.push(a.line.unwrap_or(0));
     }
-    let bytes =
-        crate::proto::encode_lock_points(&pool.strings, &class_id, &method_id, &lock_id, &line);
+    let bytes = crate::proto::encode_lock_points(&pool.strings, &class_id, &method_id, &file_id, &lock_id, &line);
     w.write_all(&bytes)?;
     Ok(())
 }

@@ -151,8 +151,18 @@ pub fn parse_dexdump_text(text: &str) -> Dex {
             in_interfaces = false; // fell through to next section
         }
         if let Some(rest) = trimmed.strip_prefix("source_file_idx") {
-            // e.g. "source_file_idx   : #5 (T01_SimpleABBA.java)"
+            // e.g. "source_file_idx   : #5 (T01_SimpleABBA.java)". dexdump prints this
+            // at the END of a class — after its methods — so apply it back to the
+            // methods already created for this class (and any created after).
             source_file = paren(rest);
+            if let Some(m) = cur_method.as_mut() {
+                m.source_file = source_file.clone();
+            }
+            if let Some(c) = cur_class.as_mut() {
+                for m in &mut c.methods {
+                    m.source_file = source_file.clone();
+                }
+            }
             continue;
         }
         // method header access flag (applies to the next body)

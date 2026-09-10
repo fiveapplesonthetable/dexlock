@@ -31,9 +31,21 @@ use std::collections::{HashMap, HashSet};
 mod dexdump;
 mod extract;
 mod juc;
+mod native;
 pub mod input;
 pub mod model;
 pub mod resolve;
+
+/// Decode a `.dex` file into the [`model::Dex`] shape. Uses the native in-process
+/// reader by default; set `$DEXLOCK_USE_DEXDUMP` to fall back to the `dexdump`
+/// subprocess (the two produce the same model — the native path is a drop-in).
+pub fn parse_dex(path: &std::path::Path) -> anyhow::Result<model::Dex> {
+    if std::env::var_os("DEXLOCK_USE_DEXDUMP").is_some() {
+        dexdump::parse_dex(path)
+    } else {
+        native::parse_dex(path)
+    }
+}
 
 /// Per-method facts the resolver consumes: the lock-acquisition sites to be named,
 /// plus the evidence used to resolve a lock's identity across calls.
@@ -69,6 +81,10 @@ pub struct Acquisition {
     pub class: String,
     /// holder method key — the stable anchor when line numbers drift.
     pub method: String,
+    /// source file name (e.g. `ActivityManagerService.java`); with `line` this is
+    /// exactly the `File.java:line` a monitor-contention record names, so the output
+    /// resolves a contention by a direct (file, line) lookup.
+    pub source_file: Option<String>,
     pub line: Option<u32>,
     pub lock: String,
 }
@@ -188,6 +204,7 @@ pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
             out.push(Acquisition {
                 class: s.class.clone(),
                 method: s.key.clone(),
+                source_file: method_by_key.get(&s.key).and_then(|m| m.source_file.clone()),
                 line: *line,
                 lock,
             });

@@ -5,15 +5,19 @@ package dexlock;
 // A columnar (struct-of-arrays) dump of every monitor-enter lock point found in a
 // set of DEX artifacts, each resolved to its canonical lock definition.
 //
-// The four *_id / line columns are parallel arrays: row i of the dump is
-// (class_id[i], method_id[i], lock_id[i], line[i]). Every id indexes into the
-// deduplicated `strings` pool, so each repeated class / method / lock name is
-// stored exactly once — the whole point of the format is that these names repeat
-// heavily, so interning them makes the output a fraction of the JSON form.
+// The five *_id / line columns are parallel arrays: row i is
+// (class_id[i], method_id[i], file_id[i], lock_id[i], line[i]). Every id indexes
+// into the deduplicated `strings` pool, so each repeated class / method / file /
+// lock name is stored exactly once.
+//
+// file_id + line are the `File.java:line` a monitor-contention record names, kept
+// as independent columns so a contention site resolves by a direct (file, line)
+// lookup and the filename interns once in the pool.
 message LockPoints {
-  repeated string strings   = 1;                 // interned string pool
-  repeated uint32 class_id  = 2 [packed = true]; // holder class (may be Outer$Inner)
+  repeated string strings   = 1;                 // interned string pool (id 0 = "")
+  repeated uint32 class_id  = 2 [packed = true]; // holder class (dotted FQN)
   repeated uint32 method_id = 3 [packed = true]; // holder method key: class.name:sig
-  repeated uint32 lock_id   = 4 [packed = true]; // canonical lock definition
-  repeated uint32 line      = 5 [packed = true]; // source line; 0 = unknown
+  repeated uint32 file_id   = 4 [packed = true]; // source file name, e.g. Foo.java
+  repeated uint32 lock_id   = 5 [packed = true]; // canonical lock definition
+  repeated uint32 line      = 6 [packed = true]; // source line; 0 = unknown
 }

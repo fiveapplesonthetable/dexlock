@@ -47,18 +47,20 @@ pub fn encode_lock_points(
     strings: &[String],
     class_id: &[u32],
     method_id: &[u32],
+    file_id: &[u32],
     lock_id: &[u32],
     line: &[u32],
 ) -> Vec<u8> {
     let mut buf =
-        Vec::with_capacity(class_id.len() * 6 + strings.iter().map(|s| s.len() + 2).sum::<usize>());
+        Vec::with_capacity(class_id.len() * 8 + strings.iter().map(|s| s.len() + 2).sum::<usize>());
     for s in strings {
         len_delim(&mut buf, 1, s.as_bytes());
     }
     packed_u32(&mut buf, 2, class_id);
     packed_u32(&mut buf, 3, method_id);
-    packed_u32(&mut buf, 4, lock_id);
-    packed_u32(&mut buf, 5, line);
+    packed_u32(&mut buf, 4, file_id);
+    packed_u32(&mut buf, 5, lock_id);
+    packed_u32(&mut buf, 6, line);
     buf
 }
 
@@ -79,7 +81,7 @@ mod tests {
     #[test]
     fn message_shape() {
         // one string, one row: tag(1,2) len=1 'a'; then packed columns each tag+len+1 byte.
-        let bytes = encode_lock_points(&["a".into()], &[0], &[0], &[0], &[5]);
+        let bytes = encode_lock_points(&["a".into()], &[0], &[0], &[0], &[0], &[5]);
         assert_eq!(bytes[0], (1 << 3) | 2); // field 1, wire 2
         assert_eq!(bytes[1], 1); // len 1
         assert_eq!(bytes[2], b'a');
