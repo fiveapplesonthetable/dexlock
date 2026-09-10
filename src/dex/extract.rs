@@ -21,12 +21,13 @@
 use super::{subst_or_self, Summary};
 use crate::dex::juc::{self, LockCall};
 use crate::dex::model::*;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 pub(super) fn extract(m: &Method, value_summaries: &HashMap<String, Lock>) -> Summary {
-    let mut s = Summary { key: m.key(), class: m.class.clone(), ..Default::default() };
-    let mut regs: HashMap<Reg, Lock> = HashMap::new();
-    let mut alloc_ty: HashMap<String, String> = HashMap::new();
+    let key = m.key(); // compute once; also used per opaque site below
+    let mut s = Summary { key: key.clone(), class: m.class.clone(), ..Default::default() };
+    let mut regs: HashMap<Reg, Lock> = HashMap::default();
+    let mut alloc_ty: HashMap<String, String> = HashMap::default();
     let mut last_ret: Option<Lock> = None;
     let mut returns: Vec<Option<Lock>> = Vec::new();
 
@@ -43,7 +44,7 @@ pub(super) fn extract(m: &Method, value_summaries: &HashMap<String, Lock>) -> Su
         }
     }
 
-    let opaque = |off: u32| Lock::new(Root::Opaque(format!("{}+{:04x}", m.key(), off)));
+    let opaque = |off: u32| Lock::new(Root::Opaque(format!("{}+{:04x}", key, off)));
 
     for insn in &m.insns {
         let line = m.line_at(insn.offset);

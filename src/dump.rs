@@ -68,12 +68,23 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
 
     let n = acqs.len();
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
-    let mut w = BufWriter::new(file);
-    match format {
-        Format::Json => write_json(&mut w, &acqs)?,
-        Format::Proto => write_proto(&mut w, &acqs)?,
+    let w = BufWriter::new(file);
+    // gzip when the output path ends in `.gz` (e.g. locks.pb.gz, locks.json.gz).
+    if out.extension().is_some_and(|e| e == "gz") {
+        let mut gz = flate2::write::GzEncoder::new(w, flate2::Compression::default());
+        match format {
+            Format::Json => write_json(&mut gz, &acqs)?,
+            Format::Proto => write_proto(&mut gz, &acqs)?,
+        }
+        gz.finish()?;
+    } else {
+        let mut w = w;
+        match format {
+            Format::Json => write_json(&mut w, &acqs)?,
+            Format::Proto => write_proto(&mut w, &acqs)?,
+        }
+        w.flush()?;
     }
-    w.flush()?;
     log::info!(
         "wrote {n} lock points to {} ({:.2?} total)",
         out.display(),

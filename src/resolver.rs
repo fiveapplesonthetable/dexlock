@@ -86,13 +86,12 @@ impl Resolver {
     }
 }
 
-/// Analyze a directory (or single jar/apk) and project it to a site→lock index.
-/// This is the one place the DEX front-end runs; parsing shells out to `dexdump`
-/// (point `$DEXLOCK_DEXDUMP` at it, or have it on `PATH`).
+/// Analyze a directory (or single jar/apk/archive) and project it to a site→lock
+/// index. This is the one place the DEX front-end runs — natively in-process by
+/// default (set `$DEXLOCK_USE_DEXDUMP` to use the `dexdump` subprocess instead).
 pub fn build_index(artifact: &Path, scope: Option<&str>) -> Result<ResolveIndex> {
-    let set = input::resolve(artifact, scope)
-        .with_context(|| format!("locating dex in {}", artifact.display()))?;
-    let parsed = input::parse_all(&set).context("parsing dex (is dexdump available?)")?;
+    let parsed = input::parse_inputs(std::slice::from_ref(&artifact.to_path_buf()), scope)
+        .with_context(|| format!("analyzing dex in {}", artifact.display()))?;
     Ok(ResolveIndex::from_acquisitions(&dex::acquisitions(&parsed)))
 }
 

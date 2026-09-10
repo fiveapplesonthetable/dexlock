@@ -83,13 +83,6 @@ fn insn_width(insns: &[u16], i: usize) -> Option<usize> {
 
 // --- public entry ----------------------------------------------------------
 
-/// Parse a `.dex` file into the model (reads it whole; container-aware).
-pub fn parse_dex(path: &std::path::Path) -> Result<Dex> {
-    let data = std::fs::read(path)
-        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
-    parse_dex_bytes(&data)
-}
-
 /// Parse a DEX image (single section or v41 container) into the model.
 pub fn parse_dex_bytes(data: &[u8]) -> Result<Dex> {
     if data.len() < 0x70 || &data[0..4] != b"dex\n" {

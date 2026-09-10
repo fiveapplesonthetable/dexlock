@@ -26,8 +26,9 @@
 
 use crate::dex::model::*;
 use rayon::prelude::*;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+pub mod archive;
 mod dexdump;
 mod extract;
 mod juc;
@@ -36,14 +37,25 @@ pub mod input;
 pub mod model;
 pub mod resolve;
 
-/// Decode a `.dex` file into the [`model::Dex`] shape. Uses the native in-process
-/// reader by default; set `$DEXLOCK_USE_DEXDUMP` to fall back to the `dexdump`
-/// subprocess (the two produce the same model — the native path is a drop-in).
-pub fn parse_dex(path: &std::path::Path) -> anyhow::Result<model::Dex> {
+/// Decode one DEX section blob into the [`model::Dex`] shape. Uses the native
+/// in-process reader by default; set `$DEXLOCK_USE_DEXDUMP` to fall back to the
+/// `dexdump` subprocess (the two produce the same model — native is a drop-in). The
+/// fallback stages the blob in a temp `.dex` because `dexdump` needs a file.
+pub fn parse_dex_blob(data: &[u8]) -> anyhow::Result<model::Dex> {
     if std::env::var_os("DEXLOCK_USE_DEXDUMP").is_some() {
-        dexdump::parse_dex(path)
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "dexlock-{}-{}.dex",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, data)?;
+        let r = dexdump::parse_dex(&path);
+        let _ = std::fs::remove_file(&path);
+        r
     } else {
-        native::parse_dex(path)
+        native::parse_dex_bytes(data)
     }
 }
 
@@ -107,21 +119,24 @@ fn param_type_name(l: &Lock, m: Option<&Method>) -> Option<String> {
 /// lock-field/parameter resolution (a monotone worklist fixpoint), and canonical
 /// naming. No deadlock-cycle, binder, or race analysis is performed.
 pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
+    let _prof = std::time::Instant::now();
     let methods: Vec<&Method> = dex.classes.iter().flat_map(|c| c.methods.iter()).collect();
 
     // Two passes: value summaries first (so `synchronized(getX())` resolves through
     // a trivial getter), then the full summaries.
-    let empty: HashMap<String, Lock> = HashMap::new();
+    let empty: HashMap<String, Lock> = HashMap::default();
     let value_summaries: HashMap<String, Lock> = methods
         .par_iter()
         .filter_map(|m| extract::extract(m, &empty).value_summary.map(|v| (m.key(), v)))
         .collect();
     let summaries: Vec<Summary> =
         methods.par_iter().map(|m| extract::extract(m, &value_summaries)).collect();
-    let mut by_key: HashMap<String, Summary> = HashMap::new();
+    let mut by_key: HashMap<String, Summary> = HashMap::default();
     for s in summaries {
         by_key.entry(s.key.clone()).or_insert(s);
     }
+    log::debug!("extract: {:.2?}", _prof.elapsed());
+    let _prof = std::time::Instant::now();
 
     // Interprocedural injection resolver (parameter/copy propagation over the call
     // graph). Seed the fixpoint with the fields it must resolve AND every
@@ -140,6 +155,8 @@ pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
         }
         injector.solve(&seeds)
     };
+    log::debug!("injector solve: {:.2?}", _prof.elapsed());
+    let _prof = std::time::Instant::now();
 
     // Lock-field aliases: `Class.field` -> the shared lock it actually names.
     //   (a) direct assignment in a method: `this.f = svc.getLock()` / a field / a static;
@@ -149,7 +166,7 @@ pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
     //       field, locked via `synchronized(this)` internally, is that field externally.
     // A field assigned different objects at different sites is left distinct (sound).
     let alias: HashMap<String, Lock> = {
-        let mut seen: HashMap<String, Option<Lock>> = HashMap::new();
+        let mut seen: HashMap<String, Option<Lock>> = HashMap::default();
         let note = |key: String, v: Option<Lock>, seen: &mut HashMap<String, Option<Lock>>| {
             match (seen.get(&key), &v) {
                 (None, _) => { seen.insert(key, v); }
@@ -171,7 +188,7 @@ pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
             .filter(|s| s.acq_sites.iter().any(|(l, _)| matches!(l.root, Root::This)))
             .map(|s| s.class.as_str())
             .collect();
-        let mut stored_in: HashMap<&str, HashSet<&str>> = HashMap::new();
+        let mut stored_in: HashMap<&str, HashSet<&str>> = HashMap::default();
         for s in by_key.values() {
             for (field, ty) in &s.alloc_stores {
                 stored_in.entry(ty.as_str()).or_default().insert(field.as_str());
@@ -192,24 +209,33 @@ pub fn acquisitions(dex: &Dex) -> Vec<Acquisition> {
     // first resolves the parameter to the concrete object bound at the method's call
     // sites; else falls back to the parameter's declared class; else grounds and
     // canonicalizes. The answer is a real definition or an opaque, never a guess.
+    log::debug!("alias: {:.2?}", _prof.elapsed());
+    let _prof = std::time::Instant::now();
     let method_by_key: HashMap<String, &Method> = methods.iter().map(|m| (m.key(), *m)).collect();
-    let mut out: Vec<Acquisition> = Vec::new();
-    for s in by_key.values() {
-        for (l, line) in &s.acq_sites {
-            let lock = injector
-                .resolve_param_lock(s.key.as_str(), l, &inj_solution)
-                .map(|obj| canonicalize(&obj, &alias).name())
-                .or_else(|| param_type_name(l, method_by_key.get(&s.key).copied()))
-                .unwrap_or_else(|| canonicalize(&ground(l, &s.class, &s.key), &alias).name());
-            out.push(Acquisition {
-                class: s.class.clone(),
-                method: s.key.clone(),
-                source_file: method_by_key.get(&s.key).and_then(|m| m.source_file.clone()),
-                line: *line,
-                lock,
-            });
-        }
-    }
+    // Naming is independent per site (read-only over the solved maps), so fan it out.
+    // Rebind as references so the parallel closures copy the borrow, not the value.
+    let (injector, alias, inj_solution, method_by_key) =
+        (&injector, &alias, &inj_solution, &method_by_key);
+    let out: Vec<Acquisition> = by_key
+        .par_iter()
+        .flat_map_iter(|(_, s)| {
+            s.acq_sites.iter().map(move |(l, line)| {
+                let lock = injector
+                    .resolve_param_lock(s.key.as_str(), l, inj_solution)
+                    .map(|obj| canonicalize(&obj, alias).name())
+                    .or_else(|| param_type_name(l, method_by_key.get(&s.key).copied()))
+                    .unwrap_or_else(|| canonicalize(&ground(l, &s.class, &s.key), alias).name());
+                Acquisition {
+                    class: s.class.clone(),
+                    method: s.key.clone(),
+                    source_file: method_by_key.get(&s.key).and_then(|m| m.source_file.clone()),
+                    line: *line,
+                    lock,
+                }
+            })
+        })
+        .collect();
+    log::debug!("naming: {:.2?}", _prof.elapsed());
     out
 }
 
@@ -284,8 +310,8 @@ struct Injector<'a> {
 
 impl<'a> Injector<'a> {
     fn build(by_key: &'a HashMap<String, Summary>) -> Self {
-        let mut sites: HashMap<&str, Vec<CallSite>> = HashMap::new();
-        let mut field_stores: HashMap<&str, Vec<Formal>> = HashMap::new();
+        let mut sites: HashMap<&str, Vec<CallSite>> = HashMap::default();
+        let mut field_stores: HashMap<&str, Vec<Formal>> = HashMap::default();
         for s in by_key.values() {
             for (callee, actuals) in &s.arg_bindings {
                 sites.entry(callee.as_str()).or_default().push(CallSite {
@@ -343,8 +369,8 @@ impl<'a> Injector<'a> {
     /// any `extra_seeds`, e.g. `synchronized(param)` operands) and their
     /// dependency edges, then run a monotone worklist to convergence.
     fn solve(&self, extra_seeds: &[Formal<'a>]) -> HashMap<Formal<'a>, Res> {
-        let mut vars: HashSet<Formal> = HashSet::new();
-        let mut rev: HashMap<Formal, Vec<Formal>> = HashMap::new(); // dep -> readers
+        let mut vars: HashSet<Formal> = HashSet::default();
+        let mut rev: HashMap<Formal, Vec<Formal>> = HashMap::default(); // dep -> readers
         let mut stack: Vec<Formal> = self.field_stores.values().flatten().copied().collect();
         stack.extend_from_slice(extra_seeds);
         while let Some((m, i)) = stack.pop() {
