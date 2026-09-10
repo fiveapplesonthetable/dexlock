@@ -246,14 +246,10 @@ no re-analysis. Rows are sorted, so the output is byte-deterministic.
   columns (`class_id`, `method_id`, `file_id`, `lock_id`, `line`), so every repeated
   name — filenames included — is stored once. Inspect with
   `protoc --decode=dexlock.LockPoints dexlock.proto < locks.pb`.
-- **`--format pprof`** — a gzipped [pprof](https://github.com/google/pprof) profile
-  of the lock graph: nodes are methods and locks, edges are "method acquires lock",
-  weighted by acquisition count. Open it with `go tool pprof -http=: locks.pb.gz` (or
-  speedscope); `-top` ranks locks by how many places take them.
 - **Compressed output**: give the output an `.gz` suffix (`-o locks.pb.gz`,
   `locks.json.gz`) to gzip it.
 
-**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.apex`), a `.tar`,
+**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`), a `.tar`,
 a gzip (`.gz`/`.tgz`/`.tar.gz`), or a directory — including *nested* archives (a zip
 of jars, a tar.gz of apks). They are extracted natively in memory (no `unzip`
 subprocess).

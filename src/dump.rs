@@ -20,8 +20,6 @@ use std::time::Instant;
 pub enum Format {
     Json,
     Proto,
-    /// A gzipped pprof profile of the lock graph (`method -> lock` edges).
-    Pprof,
 }
 
 /// Interns strings to dense ids, preserving first-seen order for a stable pool.
@@ -69,13 +67,6 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
     });
 
     let n = acqs.len();
-    // pprof is a self-contained gzipped protobuf — write it straight out.
-    if let Format::Pprof = format {
-        let bytes = crate::pprof::lock_graph(&acqs)?;
-        std::fs::write(out, &bytes).with_context(|| format!("creating {}", out.display()))?;
-        log::info!("wrote pprof lock graph ({n} edges) to {} ({:.2?} total)", out.display(), t0.elapsed());
-        return Ok(n);
-    }
     let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
     let w = BufWriter::new(file);
     // gzip when the output path ends in `.gz` (e.g. locks.pb.gz, locks.json.gz).
@@ -84,7 +75,6 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
         match format {
             Format::Json => write_json(&mut gz, &acqs)?,
             Format::Proto => write_proto(&mut gz, &acqs)?,
-            Format::Pprof => unreachable!(),
         }
         gz.finish()?;
     } else {
@@ -92,7 +82,6 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
         match format {
             Format::Json => write_json(&mut w, &acqs)?,
             Format::Proto => write_proto(&mut w, &acqs)?,
-            Format::Pprof => unreachable!(),
         }
         w.flush()?;
     }

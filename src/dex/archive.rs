@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Native, recursive extraction of DEX section blobs from any reasonable container:
-//! a bare `.dex`; a zip family member (`.jar`/`.apk`/`.zip`/`.apex`); a `.tar`; a
+//! a bare `.dex`; a zip family member (`.jar`/`.apk`/`.zip`); a `.tar`; a
 //! gzip (`.gz`/`.tgz`/`.tar.gz`); or a directory — including *nested* archives (a
 //! zip of jars, a tar.gz of apks). Everything is read in memory: no `unzip`
 //! subprocess and no temp files. Containers are recognized by magic first, then by
@@ -118,7 +118,7 @@ fn interesting(name: &str) -> bool {
 }
 
 fn is_zip_ext(name: &str) -> bool {
-    matches!(name.rsplit('.').next(), Some("jar" | "apk" | "zip" | "apex" | "aar"))
+    matches!(name.rsplit('.').next(), Some("jar" | "apk" | "zip" | "aar"))
 }
 
 fn is_tar(bytes: &[u8]) -> bool {
@@ -147,7 +147,7 @@ fn soong_jars(dir: &Path, scope: Option<&str>) -> Vec<PathBuf> {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if matches!(ext, "jar" | "apk" | "zip" | "apex" | "dex") {
+        if matches!(ext, "jar" | "apk" | "zip" | "dex") {
             out.push(p);
         }
     }

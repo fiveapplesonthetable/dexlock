@@ -113,7 +113,6 @@ struct DumpArgs {
 enum Fmt {
     Json,
     Proto,
-    Pprof,
 }
 
 fn main() -> Result<()> {
@@ -182,7 +181,6 @@ fn run_dump(args: DumpArgs) -> Result<()> {
     let format = match args.format {
         Fmt::Json => Format::Json,
         Fmt::Proto => Format::Proto,
-        Fmt::Pprof => Format::Pprof,
     };
     let n = dump::run(&args.inputs, args.scope.as_deref(), format, &args.output)?;
     println!("Wrote {n} lock points to {}", args.output.display());

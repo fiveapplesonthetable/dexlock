@@ -21,7 +21,6 @@ pub mod dex;
 pub mod dump;
 pub mod model;
 pub mod pipeline;
-pub mod pprof;
 pub mod proto;
 pub mod resolver;
 pub mod site;
