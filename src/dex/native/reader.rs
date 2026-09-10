@@ -18,8 +18,6 @@
 //! of the whole mapped image plus a movable position; random-access reads take an
 //! absolute offset and never mutate the cursor.
 
-#![allow(dead_code)]
-
 use anyhow::{bail, Result};
 
 /// A cursor over an in-memory DEX image. Sequential reads advance `pos`; the
@@ -34,9 +32,6 @@ impl<'a> Reader<'a> {
         Reader { data, pos: 0 }
     }
 
-    pub fn seek(&mut self, off: usize) {
-        self.pos = off;
-    }
 
     fn need(&self, n: usize) -> Result<()> {
         if self.pos + n > self.data.len() {
@@ -52,19 +47,7 @@ impl<'a> Reader<'a> {
         Ok(v)
     }
 
-    pub fn u16(&mut self) -> Result<u16> {
-        self.need(2)?;
-        let v = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
-        self.pos += 2;
-        Ok(v)
-    }
 
-    pub fn u32(&mut self) -> Result<u32> {
-        self.need(4)?;
-        let b = &self.data[self.pos..self.pos + 4];
-        self.pos += 4;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    }
 
     /// Read a u32 at an absolute offset without moving the cursor.
     pub fn u32_at(&self, off: usize) -> Result<u32> {

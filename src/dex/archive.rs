@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Native, recursive extraction of DEX section blobs from any reasonable container:
-//! a bare `.dex`; a zip family member (`.jar`/`.apk`/`.zip`); a `.tar`; a
-//! gzip (`.gz`/`.tgz`/`.tar.gz`); or a directory — including *nested* archives (a
-//! zip of jars, a tar.gz of apks). Everything is read in memory: no `unzip`
-//! subprocess and no temp files. Containers are recognized by magic first, then by
-//! extension, so an odd name still works.
+//! Native extraction of DEX section blobs from the artifacts that actually carry
+//! dex: a bare `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), a
+//! directory of them, or a zip that nests more jars/apks. Archives are read in
+//! memory (no `unzip` subprocess, no temp files) and recognized by magic first,
+//! then extension, so an odd name still works.
 
 use anyhow::{Context, Result};
 use std::io::{Cursor, Read};
@@ -25,7 +24,6 @@ use std::path::{Path, PathBuf};
 
 const DEX_MAGIC: &[u8] = b"dex\n";
 const ZIP_MAGIC: &[u8] = b"PK\x03\x04";
-const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
 const MAX_DEPTH: usize = 8;
 
 /// Every DEX blob reachable from `path`. Directories prefer the Soong
@@ -57,7 +55,8 @@ fn collect_bytes(name: &str, bytes: Vec<u8>, out: &mut Vec<Vec<u8>>, depth: usiz
     if bytes.starts_with(DEX_MAGIC) {
         out.push(bytes);
     } else if bytes.starts_with(ZIP_MAGIC) || is_zip_ext(name) {
-        let mut z = zip::ZipArchive::new(Cursor::new(&bytes)).with_context(|| format!("opening zip {name}"))?;
+        let mut z = zip::ZipArchive::new(Cursor::new(&bytes))
+            .with_context(|| format!("opening zip {name}"))?;
         for i in 0..z.len() {
             let mut e = z.by_index(i)?;
             if !e.is_file() {
@@ -71,34 +70,6 @@ fn collect_bytes(name: &str, bytes: Vec<u8>, out: &mut Vec<Vec<u8>>, depth: usiz
             e.read_to_end(&mut buf)?;
             collect_bytes(&ename, buf, out, depth + 1)?;
         }
-    } else if bytes.starts_with(&GZIP_MAGIC) || name.ends_with(".gz") || name.ends_with(".tgz") {
-        let mut inner = Vec::new();
-        flate2::read::GzDecoder::new(Cursor::new(&bytes))
-            .read_to_end(&mut inner)
-            .with_context(|| format!("gunzip {name}"))?;
-        // .tgz / .tar.gz decompress to a tar; a plain .gz to its single member.
-        let inner_name = if name.ends_with(".tgz") || name.ends_with(".tar.gz") {
-            "inner.tar".to_string()
-        } else {
-            name.strip_suffix(".gz").unwrap_or(name).to_string()
-        };
-        collect_bytes(&inner_name, inner, out, depth + 1)?;
-    } else if is_tar(&bytes) || name.ends_with(".tar") {
-        let mut a = tar::Archive::new(Cursor::new(&bytes));
-        for entry in a.entries()? {
-            let mut entry = entry?;
-            let ename = entry
-                .path()
-                .ok()
-                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-                .unwrap_or_default();
-            if !interesting(&ename) {
-                continue;
-            }
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            collect_bytes(&ename, buf, out, depth + 1)?;
-        }
     }
     Ok(())
 }
@@ -109,20 +80,11 @@ fn base(name: &str) -> String {
 
 /// Recurse only into members that could hold dex.
 fn interesting(name: &str) -> bool {
-    name.ends_with(".dex")
-        || name.starts_with("classes")
-        || is_zip_ext(name)
-        || name.ends_with(".tar")
-        || name.ends_with(".gz")
-        || name.ends_with(".tgz")
+    name.ends_with(".dex") || name.starts_with("classes") || is_zip_ext(name)
 }
 
 fn is_zip_ext(name: &str) -> bool {
     matches!(name.rsplit('.').next(), Some("jar" | "apk" | "zip" | "aar"))
-}
-
-fn is_tar(bytes: &[u8]) -> bool {
-    bytes.len() > 262 && &bytes[257..262] == b"ustar"
 }
 
 /// Dex-bearing jars in a directory: the Soong `system_server_dexjars` if present

@@ -249,10 +249,9 @@ no re-analysis. Rows are sorted, so the output is byte-deterministic.
 - **Compressed output**: give the output an `.gz` suffix (`-o locks.pb.gz`,
   `locks.json.gz`) to gzip it.
 
-**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`), a `.tar`,
-a gzip (`.gz`/`.tgz`/`.tar.gz`), or a directory — including *nested* archives (a zip
-of jars, a tar.gz of apks). They are extracted natively in memory (no `unzip`
-subprocess).
+**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), or a
+directory — including a zip that nests more jars/apks. They are extracted natively in
+memory (no `unzip` subprocess).
 
 ### The DEX front-end
 

@@ -189,6 +189,7 @@ mod tests {
         Acquisition {
             class: class.into(),
             method: method.into(),
+            source_file: None,
             line: Some(line),
             lock: lock.into(),
         }
