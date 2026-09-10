@@ -78,7 +78,8 @@ struct ResolveArgs {
     #[arg(long)]
     compact_counts: bool,
 
-    /// Path to `dexdump` (else `$DEXLOCK_DEXDUMP`, else `PATH`).
+    /// Use the `dexdump` back-end instead of the native reader (path to dexdump;
+    /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
 }
@@ -102,7 +103,8 @@ struct DumpArgs {
     #[arg(long, short = 'o', default_value = "dexlock_locks.pb")]
     output: PathBuf,
 
-    /// Path to `dexdump` (else `$DEXLOCK_DEXDUMP`, else `PATH`).
+    /// Use the `dexdump` back-end instead of the native reader (path to dexdump;
+    /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
 }
@@ -135,7 +137,9 @@ fn main() -> Result<()> {
 
 fn run_resolve(args: ResolveArgs) -> Result<()> {
     if let Some(d) = &args.dexdump {
+        // Passing --dexdump selects the dexdump back-end (and points at the binary).
         std::env::set_var("DEXLOCK_DEXDUMP", d);
+        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
     }
 
     let rows = CsvTraceSource { path: args.input.clone() }.fetch(&Query::default())?;
@@ -171,7 +175,9 @@ fn run_resolve(args: ResolveArgs) -> Result<()> {
 
 fn run_dump(args: DumpArgs) -> Result<()> {
     if let Some(d) = &args.dexdump {
+        // Passing --dexdump selects the dexdump back-end (and points at the binary).
         std::env::set_var("DEXLOCK_DEXDUMP", d);
+        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
     }
     let format = match args.format {
         Fmt::Json => Format::Json,

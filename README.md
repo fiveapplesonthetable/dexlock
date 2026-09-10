@@ -32,9 +32,12 @@ builder field that was assigned the service's lock.
 Resolution is bytecode dataflow, not text matching or naming heuristics. The
 analyzer in `src/dex` runs, per build:
 
-1. **Decode.** Each `classes*.dex` is disassembled (via `dexdump`) into an
-   instruction model: monitor-enter/exit, field loads/stores (`iget`/`iput`/`sget`),
-   moves, invokes, allocations, returns, branches.
+1. **Decode.** Each `classes*.dex` is decoded into an instruction model:
+   monitor-enter/exit, field loads/stores (`iget`/`iput`/`sget`), moves, invokes,
+   allocations, returns, branches. This is a native in-process reader by default
+   (`src/dex/native`, no subprocess; see [The DEX front-end](#the-dex-front-end));
+   `--dexdump` / `$DEXLOCK_USE_DEXDUMP` switches to parsing `dexdump -d` text instead,
+   which produces an identical model.
 
 2. **Per-method abstract interpretation.** Each method is summarized by tracking an
    abstract *lock value* per register. When a `monitor-enter v` is seen, register `v`
@@ -260,8 +263,9 @@ subprocess).
 Parsing is a native in-process reader by default — it decodes the DEX binary
 straight into the model (handling the v41 container format), with no `dexdump`
 subprocess. It is byte-for-byte identical to the `dexdump` path (verified on the
-whole `services.jar` dump) and ~2.5× faster end to end. Set `$DEXLOCK_USE_DEXDUMP` to
-fall back to `dexdump` (point `$DEXLOCK_DEXDUMP` at the binary). On `services.jar` +
+whole `services.jar` dump) and ~2.5× faster end to end. Pass `--dexdump <path>` (or
+set `$DEXLOCK_USE_DEXDUMP` and point `$DEXLOCK_DEXDUMP` at the binary) to switch to the
+`dexdump` back-end instead. On `services.jar` +
 `framework.jar` (~53k classes) it resolves ~18k lock points in a few seconds; the
 protobuf is roughly half the JSON size and loads columnar without a parse step.
 
@@ -287,10 +291,10 @@ pipeline::run(rows, &DirArtifactProvider { root: "jars".into() }, &resolver, &he
 cargo build --release
 ```
 
-No external service or crate beyond the published dependencies — the DEX analyzer is
-in-tree under `src/dex`. The one external process is `dexdump`, invoked during the
-analysis step (and only on a cache miss) to decode bytecode. Point `$DEXLOCK_DEXDUMP`
-at it or pass `--dexdump`; otherwise it must be on `PATH`.
+No external service, subprocess, or crate beyond the published dependencies — the
+whole DEX front-end (container parse, decode, archive extraction) is in-tree under
+`src/dex`. `dexdump` is **not** required; it is only used if you opt into the fallback
+with `--dexdump` / `$DEXLOCK_USE_DEXDUMP`.
 
 ## Tests
 
