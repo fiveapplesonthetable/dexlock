@@ -230,21 +230,40 @@ dexlock dump services.jar framework.jar --format json -o locks.json
 # a directory or a Soong out tree also works; --scope <substr> narrows it
 ```
 
-Each lock point is `(class, method, line, lock)` where `lock` is the canonical
+Each lock point is `(class, method, file, line, lock)` where `lock` is the canonical
 definition (e.g. `com.android.server.am.ActivityManagerService.mProcLock`, or an
-opaque `?@…` when the lock genuinely escapes the analysis). Rows are sorted, so the
-output is byte-deterministic across runs and thread counts.
+opaque `?@…` when the lock genuinely escapes the analysis). `file` + `line` are the
+`File.java:line` a monitor-contention record names (what ART logs at a contention),
+so a contention site resolves against the dump by a direct `(file, line)` lookup —
+no re-analysis. Rows are sorted, so the output is byte-deterministic.
 
-- **`--format json`** — a JSON array of `{class, method, line, lock}` objects.
+- **`--format json`** — a JSON array of `{class, method, file, line, lock}` objects.
 - **`--format proto`** (default) — a `dexlock.LockPoints` message (see
   [`dexlock.proto`](dexlock.proto)): a deduplicated string pool plus packed-uint32
-  columns (`class_id`, `method_id`, `lock_id`, `line`), so every repeated
-  class/method/lock name is stored once. Decode with any protobuf reader, or inspect
-  with `protoc --decode=dexlock.LockPoints dexlock.proto < locks.pb`.
+  columns (`class_id`, `method_id`, `file_id`, `lock_id`, `line`), so every repeated
+  name — filenames included — is stored once. Inspect with
+  `protoc --decode=dexlock.LockPoints dexlock.proto < locks.pb`.
+- **`--format pprof`** — a gzipped [pprof](https://github.com/google/pprof) profile
+  of the lock graph: nodes are methods and locks, edges are "method acquires lock",
+  weighted by acquisition count. Open it with `go tool pprof -http=: locks.pb.gz` (or
+  speedscope); `-top` ranks locks by how many places take them.
+- **Compressed output**: give the output an `.gz` suffix (`-o locks.pb.gz`,
+  `locks.json.gz`) to gzip it.
 
-On `services.jar` + `framework.jar` (~53k classes) this resolves ~18k lock points in
-seconds; the protobuf is roughly half the size of the JSON and loads columnar without
-a parse step.
+**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.apex`), a `.tar`,
+a gzip (`.gz`/`.tgz`/`.tar.gz`), or a directory — including *nested* archives (a zip
+of jars, a tar.gz of apks). They are extracted natively in memory (no `unzip`
+subprocess).
+
+### The DEX front-end
+
+Parsing is a native in-process reader by default — it decodes the DEX binary
+straight into the model (handling the v41 container format), with no `dexdump`
+subprocess. It is byte-for-byte identical to the `dexdump` path (verified on the
+whole `services.jar` dump) and ~2.5× faster end to end. Set `$DEXLOCK_USE_DEXDUMP` to
+fall back to `dexdump` (point `$DEXLOCK_DEXDUMP` at the binary). On `services.jar` +
+`framework.jar` (~53k classes) it resolves ~18k lock points in a few seconds; the
+protobuf is roughly half the JSON size and loads columnar without a parse step.
 
 ## Library
 
