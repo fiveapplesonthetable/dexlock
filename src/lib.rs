@@ -11,12 +11,17 @@
 //! - [`artifact::ArtifactProvider`] — where a build's jars/apks come from (a
 //!   directory and an in-process archive unpacker ship; plug in a downloader).
 //! - [`resolver::Resolver`] — the in-process, disk-cached resolution core.
+//!
+//! [`dump`] is the standalone path: analyze jars and emit *every* lock point with
+//! its canonical definition, as JSON or a compact columnar protobuf.
 
 pub mod artifact;
 pub mod csv_io;
 pub mod dex;
+pub mod dump;
 pub mod model;
 pub mod pipeline;
+pub mod proto;
 pub mod resolver;
 pub mod site;
 pub mod traces;

@@ -1,13 +1,17 @@
-//! dexlock CLI: resolve a contention table's source sites to canonical locks.
+//! dexlock CLI.
 //!
-//! Portable by default — it reads a CSV and resolves against local artifacts, with
-//! no dependency on any particular build or trace infrastructure. Point it at a
-//! directory of jars/apks (or per-build subdirectories), or supply your own
-//! artifact/trace providers via the library API.
+//! Two subcommands:
+//!   * `resolve` — the portable path: read a contention CSV and resolve each source
+//!     site to its canonical lock against local artifacts.
+//!   * `dump` — analyze jars directly and emit *every* lock point, each resolved to
+//!     its canonical definition, as JSON or a compact columnar protobuf.
+//!
+//! `-j/--threads` bounds the worker pool for either subcommand (default: all cores).
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use dexlock::artifact::{ArtifactProvider, DirArtifactProvider, ZipArtifactProvider};
+use dexlock::dump::{self, Format};
 use dexlock::model::Query;
 use dexlock::pipeline::{self, Output};
 use dexlock::resolver::{Options, Resolver};
@@ -15,8 +19,26 @@ use dexlock::traces::{CsvTraceSource, TraceSource};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "dexlock", about = "Resolve monitor-contention sites to their canonical locks")]
-struct Args {
+#[command(name = "dexlock", about = "Resolve monitor locks from DEX bytecode", version)]
+struct Cli {
+    /// Worker threads for parsing and analysis (default: all available cores).
+    #[arg(short = 'j', long, global = true)]
+    threads: Option<usize>,
+
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum Cmd {
+    /// Resolve a contention CSV's source sites to their canonical locks.
+    Resolve(ResolveArgs),
+    /// Dump every lock point in the given jars, each resolved to its definition.
+    Dump(DumpArgs),
+}
+
+#[derive(Parser, Debug)]
+struct ResolveArgs {
     /// Input contention CSV (columns: build_id, device_name, blocked_src,
     /// blocking_src, short_blocked_method, short_blocking_method, ...).
     #[arg(long)]
@@ -61,12 +83,56 @@ struct Args {
     dexdump: Option<PathBuf>,
 }
 
+#[derive(Parser, Debug)]
+struct DumpArgs {
+    /// Jars / apks / `.dex` files / directories to analyze. Multiple inputs are
+    /// merged so the resolver sees calls across all of them.
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Narrow a directory input to jars whose name contains this substring.
+    #[arg(long)]
+    scope: Option<String>,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = Fmt::Proto)]
+    format: Fmt,
+
+    /// Output path.
+    #[arg(long, short = 'o', default_value = "dexlock_locks.pb")]
+    output: PathBuf,
+
+    /// Path to `dexdump` (else `$DEXLOCK_DEXDUMP`, else `PATH`).
+    #[arg(long)]
+    dexdump: Option<PathBuf>,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum Fmt {
+    Json,
+    Proto,
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format_timestamp_secs()
         .init();
-    let args = Args::parse();
+    let cli = Cli::parse();
 
+    if let Some(j) = cli.threads {
+        match rayon::ThreadPoolBuilder::new().num_threads(j).build_global() {
+            Ok(()) => log::info!("using {j} worker threads"),
+            Err(e) => log::warn!("could not set thread pool to {j}: {e}"),
+        }
+    }
+
+    match cli.cmd {
+        Cmd::Resolve(a) => run_resolve(a),
+        Cmd::Dump(a) => run_dump(a),
+    }
+}
+
+fn run_resolve(args: ResolveArgs) -> Result<()> {
     if let Some(d) = &args.dexdump {
         std::env::set_var("DEXLOCK_DEXDUMP", d);
     }
@@ -99,5 +165,18 @@ fn main() -> Result<()> {
     )?;
 
     println!("Done. Wrote {}", args.output.display());
+    Ok(())
+}
+
+fn run_dump(args: DumpArgs) -> Result<()> {
+    if let Some(d) = &args.dexdump {
+        std::env::set_var("DEXLOCK_DEXDUMP", d);
+    }
+    let format = match args.format {
+        Fmt::Json => Format::Json,
+        Fmt::Proto => Format::Proto,
+    };
+    let n = dump::run(&args.inputs, args.scope.as_deref(), format, &args.output)?;
+    println!("Wrote {n} lock points to {}", args.output.display());
     Ok(())
 }

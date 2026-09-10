@@ -166,6 +166,28 @@ fn collect_soong_jars(dir: &Path, scope: Option<&str>) -> Vec<PathBuf> {
     out
 }
 
+/// Resolve, parse and merge several inputs (jars/apks/dex files/dirs) into one
+/// `Dex`, so the interprocedural resolver sees calls across all of them. Every
+/// input's dexes are gathered first, then all are parsed in a single parallel pass
+/// (so the `dexdump` subprocesses overlap across jars, not just within one).
+pub fn parse_inputs(paths: &[PathBuf], scope: Option<&str>) -> Result<Dex> {
+    if paths.is_empty() {
+        anyhow::bail!("no inputs to analyze");
+    }
+    // Keep the DexSets (and their temp dirs) alive until parsing finishes.
+    let sets: Vec<DexSet> = paths
+        .iter()
+        .map(|p| resolve(p, scope).with_context(|| format!("locating dex in {}", p.display())))
+        .collect::<Result<_>>()?;
+    let files: Vec<&PathBuf> = sets.iter().flat_map(|s| s.files.iter()).collect();
+    if files.is_empty() {
+        anyhow::bail!("no dex files found in the given inputs");
+    }
+    let parsed: Vec<Dex> =
+        files.par_iter().map(|p| dexdump::parse_dex(p)).collect::<Result<Vec<_>>>()?;
+    Ok(merge_dexes(parsed))
+}
+
 /// Parse every dex (in parallel) and merge into one `Dex`.
 pub fn parse_all(set: &DexSet) -> Result<Dex> {
     if set.files.is_empty() {

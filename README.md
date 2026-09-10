@@ -199,8 +199,12 @@ implementations and the resolver, cache, and lookup are unchanged.
 
 ## CLI
 
+Two subcommands. `-j/--threads` bounds the worker pool for either (default: all cores).
+
+### `resolve` — answer a contention CSV
+
 ```sh
-dexlock \
+dexlock resolve \
   --input contention.csv \
   --artifacts ./jars \        # dir of jars/apks, or a parent with <build_id>/ subdirs
   --output resolved.csv \
@@ -213,6 +217,34 @@ Input columns required: `build_id`, `device_name`, `blocked_src`, `blocking_src`
 `short_blocked_method`, `short_blocking_method`. Any other columns are preserved.
 `--compact-counts` emits `(resolved_blocked_lock, resolved_blocking_lock,
 short_blocked_method, short_blocking_method, traces)` sorted by count.
+
+### `dump` — every lock point, resolved to its definition
+
+Skip the CSV. Point `dump` at jars and it emits *every* monitor-enter in them, each
+named by its canonical lock (the same analysis `resolve` uses, run once over the
+merged inputs). Output is JSON or a compact columnar protobuf.
+
+```sh
+dexlock -j 16 dump services.jar framework.jar --format proto -o locks.pb
+dexlock dump services.jar framework.jar --format json -o locks.json
+# a directory or a Soong out tree also works; --scope <substr> narrows it
+```
+
+Each lock point is `(class, method, line, lock)` where `lock` is the canonical
+definition (e.g. `com.android.server.am.ActivityManagerService.mProcLock`, or an
+opaque `?@…` when the lock genuinely escapes the analysis). Rows are sorted, so the
+output is byte-deterministic across runs and thread counts.
+
+- **`--format json`** — a JSON array of `{class, method, line, lock}` objects.
+- **`--format proto`** (default) — a `dexlock.LockPoints` message (see
+  [`dexlock.proto`](dexlock.proto)): a deduplicated string pool plus packed-uint32
+  columns (`class_id`, `method_id`, `lock_id`, `line`), so every repeated
+  class/method/lock name is stored once. Decode with any protobuf reader, or inspect
+  with `protoc --decode=dexlock.LockPoints dexlock.proto < locks.pb`.
+
+On `services.jar` + `framework.jar` (~53k classes) this resolves ~18k lock points in
+seconds; the protobuf is roughly half the size of the JSON and loads columnar without
+a parse step.
 
 ## Library
 
