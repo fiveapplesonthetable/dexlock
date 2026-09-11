@@ -331,6 +331,11 @@ impl<'a> Section<'a> {
                 Some(w) if w > 0 => w,
                 _ => break,
             };
+            // A truncated tail instruction (fewer code units than its width) would
+            // make decode() read past the end; stop rather than index out of bounds.
+            if i + w > units.len() {
+                break;
+            }
             let u0 = units[i];
             let is_payload = (u0 & 0xff) == 0 && u0 != 0;
             if !is_payload {
@@ -448,5 +453,39 @@ impl<'a> Section<'a> {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn widths_spot_check() {
+        assert_eq!(WIDTHS[0x1d], 1); // monitor-enter (11x)
+        assert_eq!(WIDTHS[0x52], 2); // iget (22c)
+        assert_eq!(WIDTHS[0x60], 2); // sget (21c)
+        assert_eq!(WIDTHS[0x6e], 3); // invoke-virtual (35c)
+        assert_eq!(WIDTHS[0x74], 3); // invoke-virtual/range (3rc)
+        assert_eq!(WIDTHS[0x18], 5); // const-wide (51l)
+        assert_eq!(WIDTHS[0x00], 1); // nop
+    }
+
+    #[test]
+    fn insn_width_payloads() {
+        // packed-switch-payload: ident 0x0100, size 3 -> 3*2 + 4 = 10 units
+        assert_eq!(insn_width(&[0x0100, 3], 0), Some(10));
+        // sparse-switch-payload: ident 0x0200, size 2 -> 2*4 + 2 = 10 units
+        assert_eq!(insn_width(&[0x0200, 2], 0), Some(10));
+        // fill-array-data-payload: ident 0x0300, ew 1, count 5 -> ceil(5/2) + 4 = 7
+        assert_eq!(insn_width(&[0x0300, 1, 5, 0], 0), Some(7));
+        assert_eq!(insn_width(&[0x0000], 0), Some(1)); // plain nop
+        assert_eq!(insn_width(&[0x001d], 0), Some(1)); // monitor-enter v0
+    }
+
+    #[test]
+    fn version_parse() {
+        assert_eq!(dex_version(b"dex\n041\0"), 41);
+        assert_eq!(dex_version(b"dex\n035\0"), 35);
     }
 }
