@@ -264,34 +264,6 @@ set `$DEXLOCK_USE_DEXDUMP` and point `$DEXLOCK_DEXDUMP` at the binary) to switch
 `framework.jar` (~53k classes) it resolves ~18k lock points in a few seconds; the
 protobuf is roughly half the JSON size and loads columnar without a parse step.
 
-## `race` — inconsistent-locking (data-race) findings
-
-```sh
-dexlock race services.jar -o races.json
-```
-
-Builds on the same lock resolution: for each method it tracks the set of locks
-*held* at every point (monitor-enter/exit, `Lock.lock/unlock`, and a `synchronized`
-method's implicit monitor) and records each instance-field access with the locks held
-at it. A field is flagged when it is written somewhere, is not `final`/`volatile`,
-and is accessed **under a lock in several places but with no lock in others** — the
-guard is inferred as the lock held on most of its guarded accesses (restricted to a
-lock of the field's own class, which removes the incidental cross-class noise), and
-the unlocked accesses are reported with `file:line`.
-
-```json
-{ "field": "com.example.Foo.mX", "guard": "com.example.Foo.mLock",
-  "guarded_accesses": 12,
-  "unguarded": [ { "method": "com.example.Foo.peek:()I",
-                   "file": "Foo.java", "line": 42, "write": false, "held": [] } ] }
-```
-
-It is a heuristic, like [RacerD](https://fbinfer.com/docs/checker-racerd/): it infers
-the intended guard from the guarded accesses, so it can miss races on never-guarded
-fields and flag benign single-threaded ones. Treat it as a lint signal — most useful
-as a presubmit that diffs findings before/after a change and flags a newly-unguarded
-access to an otherwise-guarded field.
-
 ## Library
 
 ```rust

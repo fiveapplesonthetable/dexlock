@@ -35,28 +35,6 @@ enum Cmd {
     Resolve(ResolveArgs),
     /// Dump every lock point in the given jars, each resolved to its definition.
     Dump(DumpArgs),
-    /// Report fields that are locked inconsistently (likely data races).
-    Race(RaceArgs),
-}
-
-#[derive(Parser, Debug)]
-struct RaceArgs {
-    /// Jars / apks / `.dex` files / directories to analyze (merged).
-    #[arg(required = true)]
-    inputs: Vec<PathBuf>,
-
-    /// Narrow a directory input to jars whose name contains this substring.
-    #[arg(long)]
-    scope: Option<String>,
-
-    /// Output path (JSON).
-    #[arg(long, short = 'o', default_value = "dexlock_races.json")]
-    output: PathBuf,
-
-    /// Use the `dexdump` back-end instead of the native reader (path to dexdump;
-    /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
-    #[arg(long)]
-    dexdump: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -153,18 +131,7 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::Resolve(a) => run_resolve(a),
         Cmd::Dump(a) => run_dump(a),
-        Cmd::Race(a) => run_race(a),
     }
-}
-
-fn run_race(args: RaceArgs) -> Result<()> {
-    if let Some(d) = &args.dexdump {
-        std::env::set_var("DEXLOCK_DEXDUMP", d);
-        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-    }
-    let n = dump::run_race(&args.inputs, args.scope.as_deref(), &args.output)?;
-    println!("Wrote {n} inconsistently-locked fields to {}", args.output.display());
-    Ok(())
 }
 
 fn run_resolve(args: ResolveArgs) -> Result<()> {

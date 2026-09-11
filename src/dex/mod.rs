@@ -35,7 +35,6 @@ mod juc;
 mod native;
 pub mod input;
 pub mod model;
-pub mod race;
 pub mod resolve;
 
 /// Decode one DEX section blob into the [`model::Dex`] shape. Uses the native

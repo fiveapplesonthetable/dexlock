@@ -75,21 +75,3 @@ fn native_matches_dexdump_on_fixture() {
 
     assert_eq!(native, viadexdump, "native and dexdump front-ends diverged");
 }
-
-#[test]
-fn fixture_race_detected() {
-    // t.Race.mX is written/read under t.Race.mLock in set()/getLocked(), but read
-    // with no lock in peek() — the classic inconsistent-locking race.
-    let bytes = include_bytes!("fixtures/race.dex");
-    let d = dex::parse_dex_blob(bytes).expect("parse race fixture");
-    let races = dex::race::races(&d);
-    assert_eq!(races.len(), 1, "expected exactly one racy field");
-    let r = &races[0];
-    assert_eq!(r.field, "t.Race.mX");
-    assert_eq!(r.guard, "t.Race.mLock");
-    assert_eq!(r.guarded, 2);
-    assert_eq!(r.unguarded.len(), 1);
-    assert_eq!(r.unguarded[0].method, "t.Race.peek:()I");
-    assert!(!r.unguarded[0].write);
-    assert_eq!(r.unguarded[0].line, Some(7));
-}
