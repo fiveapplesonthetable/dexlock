@@ -447,7 +447,12 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
         // known class nor a formal: a formal's targets come exactly from what callers
         // pass (below), which fan-out would only blur.
         let on_formal = arg_formals.first().is_some_and(|f| f.is_some());
-        if precise.is_none() && !on_formal && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
+        // A binder entry (abstract AIDL method, $Stub$Proxy, transact) runs its
+        // implementation in another process: no lock crosses it, so it is never
+        // linked to the implementations (the in-process local-stub case is a
+        // deliberate under-approximation).
+        let binder_target = targets.iter().any(|&t| is_binder(methods[t as usize]));
+        if precise.is_none() && !on_formal && !binder_target && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
             if let Some(ds) = decl.get(&sigk) {
                 if ds.len() <= opts.cha_cap {
                     for &d in ds {
@@ -471,7 +476,7 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             if class_set.contains(class.as_str()) { unlinked += 1 } else { external += 1 }
         }
         calls.push(Call { caller, line, held, targets });
-        let recv_formal = if matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
+        let recv_formal = if matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) && !binder_target {
             arg_formals.first().copied().flatten().map(|j| (sigk.clone(), j))
         } else {
             None
