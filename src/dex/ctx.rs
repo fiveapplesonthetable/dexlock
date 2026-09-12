@@ -62,7 +62,7 @@ const ACC_ABSTRACT: u32 = 0x400;
 pub struct Span {
     pub lock: u32,
     pub enter: u32,
-    /// Exclusive; [`TO_END`] when the release was not observed in the method.
+    /// Exclusive; `u32::MAX` when the release was not observed in the method.
     pub exit: u32,
     /// Locks (intra-procedural) already held when this one was taken.
     pub held: Vec<u32>,
@@ -957,7 +957,7 @@ impl<R: Read> In<R> {
         let n = self.u32()? as usize;
         let mut bytes = vec![0u8; n * 4];
         self.0.read_exact(&mut bytes)?;
-        Ok(bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+        Ok(bytes.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
     }
     fn str(&mut self) -> Result<String> {
         let n = self.u32()? as usize;

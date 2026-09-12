@@ -21,9 +21,10 @@
 //! A global phase then resolves lock-field aliases (a field that merely holds
 //! another object's lock is followed to that object, across constructors, setters
 //! and inheritance, as a monotone parameter/copy-propagation fixpoint) and names
-//! each site by its canonical lock. The `binder` module reuses the same held-lock
-//! tracking to flag binder calls made while a lock is held; deadlock-cycle and race
-//! analysis remain out of scope.
+//! each site by its canonical lock. The `flow` module is the shared held-lock
+//! dataflow; `binder` flags binder calls made while a lock is held; `ctx` builds the
+//! queryable lock-context index (locks that may be held at any point, witness paths,
+//! and the lock-order graph with its inversions). Race analysis is out of scope.
 
 use crate::dex::model::*;
 use rayon::prelude::*;

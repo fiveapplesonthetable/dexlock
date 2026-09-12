@@ -134,7 +134,7 @@ impl<'a> Ext4<'a> {
             let per = self.bs / 4;
             let ptrs = |b: u32| -> Result<Vec<u32>> {
                 if b == 0 { return Ok(vec![0; per]) }
-                Ok(self.block(b as u64)?.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
+                Ok(self.block(b as u64)?.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect())
             };
             for &p in &ptrs(direct[12])? {
                 put(&mut map, p);
