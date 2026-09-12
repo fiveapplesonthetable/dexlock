@@ -204,6 +204,8 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
         }
     }
     log::debug!("ctx: canonical sites {:.2?}", t0.elapsed());
+    let effects = flow::effects(dex);
+    log::info!("ctx: {} lock-helper methods (acquire or release for their caller)", effects.len());
 
     // Parallel per-method walk.
     let scanned: Vec<Scanned> = methods
@@ -231,7 +233,7 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             let named = |held: &[Lock], line: u32, name_of: &mut dyn FnMut(&Lock, u32) -> String| -> Vec<String> {
                 held.iter().map(|l| name_of(l, line)).filter(|n| !n.starts_with("?@")).collect()
             };
-            flow::walk(m, &[], |e| match e {
+            flow::walk(m, &[], &effects, |e| match e {
                 Event::Acquire { lock, line, held } => {
                     let line = line.unwrap_or(NO_LINE);
                     let c = name_of(lock, line);
@@ -694,18 +696,35 @@ impl Index {
         cyc
     }
 
+    /// Locks held (intra or may-held on entry) at a site, as a name set.
+    fn held_set(&self, m: u32, line: u32) -> HashSet<u32> {
+        let mut s: HashSet<u32> = self.intra_held(m, line).into_iter().collect();
+        s.extend(self.may_held(m).into_iter().map(|(l, _)| l));
+        s
+    }
+
+    /// A lock (other than the pair itself) held at both sites of an inversion: an
+    /// outer lock that serializes the two orders, which makes the pair benign.
+    pub fn gate(&self, a: &OrderEdge, b: &OrderEdge) -> Option<u32> {
+        let ha = self.held_set(a.method, a.line);
+        let hb = self.held_set(b.method, b.line);
+        ha.intersection(&hb).copied().filter(|&l| l != a.from && l != a.to).min()
+    }
+
     /// Pairs of locks acquired in both orders — the concrete deadlock candidates —
-    /// tightest first: by the larger of the two distances, then by more occurrences.
-    pub fn inversions(&self) -> Vec<(&OrderEdge, &OrderEdge)> {
+    /// ungated first, then tightest: by the larger of the two distances, then by
+    /// more occurrences. Each with its gate lock, if any.
+    pub fn inversions(&self) -> Vec<(&OrderEdge, &OrderEdge, Option<u32>)> {
         let at: HashMap<(u32, u32), usize> =
             self.order.iter().enumerate().map(|(i, e)| ((e.from, e.to), i)).collect();
-        let mut v: Vec<(&OrderEdge, &OrderEdge)> = self
+        let mut v: Vec<(&OrderEdge, &OrderEdge, Option<u32>)> = self
             .order
             .iter()
             .filter(|e| e.from < e.to)
             .filter_map(|e| at.get(&(e.to, e.from)).map(|&j| (e, &self.order[j])))
+            .map(|(a, b)| (a, b, self.gate(a, b)))
             .collect();
-        v.sort_by_key(|(a, b)| (a.dist.max(b.dist), std::cmp::Reverse(a.count.min(b.count)), a.from, a.to));
+        v.sort_by_key(|(a, b, g)| (g.is_some(), a.dist.max(b.dist), std::cmp::Reverse(a.count.min(b.count)), a.from, a.to));
         v
     }
 

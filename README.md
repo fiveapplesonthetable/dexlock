@@ -347,10 +347,11 @@ ActivityManagerService.java:4589  in  …ActivityManagerService.attachApplicatio
 
 A lock query reports where it is acquired, the methods it may be held on entry to
 (nearest first), and its lock-order neighbours in both directions — each edge with
-a count, its distance, and an example site. `--cycles` lists the non-trivial
-strongly connected components of that order graph: sets of locks acquired in
-inconsistent orders, i.e. deadlock candidates, with the edges and sites that form
-them.
+a count, its distance, and an example site. `--cycles` leads with the pairs
+of locks acquired in both orders — the concrete deadlock candidates — each with
+both witness sites, and separates the pairs that are *gated* (both orders occur
+under a common outer lock, so they serialize) from those with no such lock; the
+strongly connected groups of the order graph follow.
 
 How it works. Every method is walked once for its lock *spans* (each acquisition
 with the line range it is held over) and its call sites, each tagged with the locks
@@ -361,7 +362,9 @@ so the held set is solved as a forward dataflow over basic blocks (branch, switc
 fall-through, and exception edges) rather than read off a linear scan — which
 misreads everything after the first textual exit as unlocked. `tryLock` is held on
 its success path only; `readLock()`/`writeLock()` views are the parent lock in that
-mode. Call sites link to their static target and, for virtual/interface
+mode. A lock taken or released *through a helper* (`acquireFooLock()` that returns
+holding it, `releaseFooLock()`) is tracked too: each method's net lock effect on its
+caller is solved as a fixpoint and applied at its call sites. Call sites link to their static target and, for virtual/interface
 dispatch with a small implementation set (`--cha-cap`, default 16), to each
 override; a broad interface such as `Runnable.run` is left unlinked on purpose,
 since "every lock any caller holds" is noise. Lock names are the canonical

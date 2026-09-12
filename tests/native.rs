@@ -157,7 +157,7 @@ fn fixture_ctx_binder_sites() {
 /// Control-flow-aware held-lock tracking over `fixtures/cfg.dex`: the locks held at
 /// each helper call are exactly those of its enclosing block, across an early
 /// return, a catch handler, try/finally, a switch, a loop, a successful `tryLock`,
-/// and a read-write lock view.
+/// a read-write lock view, and a lock taken/released through helper methods.
 #[test]
 fn fixture_cfg_held() {
     let bytes = include_bytes!("fixtures/cfg.dex");
@@ -191,6 +191,8 @@ fn fixture_cfg_held() {
     assert_eq!(held_at("post"), Vec::<String>::new(), "tryLock result does not leak past the join");
     assert_eq!(held_at("inRead"), vec!["t.Cfg.mRw.read".to_string()]);
     assert_eq!(held_at("afterRead"), Vec::<String>::new());
+    assert_eq!(held_at("inHelperLock"), vec!["t.Cfg.mL".to_string()], "lock taken by a helper is held after it returns");
+    assert_eq!(held_at("afterHelper"), Vec::<String>::new(), "lock released by a helper");
 }
 
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends

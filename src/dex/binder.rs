@@ -48,6 +48,7 @@ pub struct Finding {
 pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
     let ifaces = binder_interfaces(dex);
     let entry = flow::entry_held(dex, closed_world);
+    let effects = flow::effects(dex);
     let empty: Vec<Lock> = Vec::new();
     let mut out: Vec<Finding> = dex
         .classes
@@ -56,7 +57,7 @@ pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
         .flat_map(|m| {
             let seed = entry.get(&m.key()).unwrap_or(&empty);
             let mut fs = Vec::new();
-            flow::scan(m, seed, |inv, held, line| {
+            flow::scan(m, seed, &effects, |inv, held, line| {
                 if is_binder_call(inv, &ifaces) && held.iter().any(|l| !l.is_opaque()) {
                     fs.push(Finding {
                         method: m.key(),

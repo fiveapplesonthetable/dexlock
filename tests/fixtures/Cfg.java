@@ -2,7 +2,8 @@
 //
 // Each helper call is made in a specific lock context; the test asserts the locks
 // held at each call site. Early return, a catch handler, try/finally, a switch, a
-// loop, a successful tryLock, and a read-write lock view all appear.
+// loop, a successful tryLock, a read-write lock view, and a lock taken and released
+// through helper methods all appear.
 // Rebuild: javac -d out Cfg.java && d8 --min-api 21 --output out out/t/*.class && cp out/classes.dex cfg.dex
 package t;
 
@@ -84,7 +85,18 @@ class Cfg {
         afterRead();          // released
     }
 
+    void helper() {
+        take();               // a helper takes mL and returns holding it
+        inHelperLock();       // mL held
+        drop();               // a helper releases it
+        afterHelper();        // not held
+    }
+
+    private void take() { mL.lock(); }
+    private void drop() { mL.unlock(); }
+
     void after() {} void outside() {} void risky() {} void inCatch() {} void inFinally() {}
     void s1() {} void s2() {} void s3() {} void body() {} void tail() {}
     void inTry() {} void post() {} void inRead() {} void afterRead() {}
+    void inHelperLock() {} void afterHelper() {}
 }

@@ -31,6 +31,13 @@
 //! stays a linear pass, as in resolution; the operand is defined immediately
 //! before its use, so that is exact where it matters and byte-verified there.
 //!
+//! Locks taken or released *through a helper* — `acquireFooLock()` that returns
+//! holding the lock, `releaseFooLock()` that drops it — are invisible to a walk that
+//! treats calls as opaque. [`effects`] computes each method's net lock effect (the
+//! locks it still holds on every return and the locks it releases for its caller),
+//! as a fixpoint so nested helpers compose, and [`walk`] applies the callee's
+//! effect at each call site.
+//!
 //! [`entry_held`] lifts the intra pass past the caller-holds-the-lock convention
 //! (`…Locked` / `@GuardedBy` helpers): it infers the locks held on entry to each
 //! *private* method as the intersection of the held sets at all of its call sites,
@@ -90,17 +97,38 @@ enum LockOp {
     None,
 }
 
-/// Held-lock stack: the locks plus the line each was taken on (`None` = on entry).
+/// A method's net lock effect on its caller: locks it still holds on every return
+/// (taken inside and not released) and locks it releases that it did not take.
+#[derive(Clone, Default, PartialEq)]
+pub(super) struct Effect {
+    pub acquires: Vec<Lock>,
+    pub releases: Vec<Lock>,
+}
+
+/// Net lock effects by method key; methods with no effect are absent.
+pub(super) type Effects = HashMap<String, Effect>;
+
+/// Held-lock stack: the locks plus the line each was taken on (`None` = on entry),
+/// and the named releases that matched nothing (released on the caller's behalf).
 #[derive(Clone, PartialEq)]
 struct State {
     locks: Vec<Lock>,
     enters: Vec<Option<u32>>,
+    unmatched: Vec<Lock>,
 }
 
 impl State {
     fn push(&mut self, l: Lock, line: Option<u32>) {
         self.locks.push(l);
         self.enters.push(line);
+    }
+    /// Release `name`: pop the innermost such lock, or note it as released for the caller.
+    fn release(&mut self, name: &str, lock: &Lock) -> Option<(Lock, Option<u32>)> {
+        let popped = self.pop(Some(name));
+        if popped.is_none() && !self.unmatched.iter().any(|u| u.name() == name) {
+            self.unmatched.push(lock.clone());
+        }
+        popped
     }
     /// Pop the innermost lock named `name` (or the innermost of all when `None`).
     fn pop(&mut self, name: Option<&str>) -> Option<(Lock, Option<u32>)> {
@@ -110,24 +138,35 @@ impl State {
         };
         Some((self.locks.remove(pos), self.enters.remove(pos)))
     }
-    /// Intersection by name, keeping this state's order. True if it shrank.
+    /// Intersection by name, keeping this state's order. True if anything shrank.
     fn meet(&mut self, other: &State) -> bool {
-        let before = self.locks.len();
+        let before = (self.locks.len(), self.unmatched.len());
         let keep: Vec<bool> = self.locks.iter().map(|l| other.locks.iter().any(|o| o.name() == l.name())).collect();
         let mut i = 0;
         self.locks.retain(|_| { let k = keep[i]; i += 1; k });
         let mut i = 0;
         self.enters.retain(|_| { let k = keep[i]; i += 1; k });
-        self.locks.len() != before
+        self.unmatched.retain(|u| other.unmatched.iter().any(|o| o.name() == u.name()));
+        (self.locks.len(), self.unmatched.len()) != before
     }
 }
 
 /// Walk `m` reporting each acquire, release, and call with the locks held there,
-/// seeded with `entry` (locks held on entry to the method).
-pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
+/// seeded with `entry` (locks held on entry) and applying callees' `effects`.
+pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut f: F) {
+    run(m, entry, effects, Some(&mut f));
+}
+
+/// Callback type used when `run` is driven for its return states only.
+type NoEmit = fn(Event);
+
+/// The held-lock dataflow over `m`. Emits events through `emit` (replaying each
+/// reachable block from its converged entry state) and returns the out-states of
+/// the reachable blocks that end in a `return`.
+fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit: Option<&mut F>) -> Vec<State> {
     let n = m.insns.len();
     if n == 0 {
-        return;
+        return Vec::new();
     }
     let key = m.key();
     let ground = |l: &Lock| l.ground(&m.class, &key);
@@ -235,6 +274,7 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
     };
     let mut succ: Vec<Vec<usize>> = vec![Vec::new(); nb];
     let mut exc: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut returns: Vec<bool> = vec![false; nb];
     for (b, &(_, end)) in blocks.iter().enumerate() {
         let fall = (b + 1 < nb).then_some(b + 1);
         match &m.insns[end - 1].op {
@@ -247,7 +287,8 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
                 succ[b].extend(ts.iter().filter_map(|t| blk(*t)));
                 succ[b].extend(fall);
             }
-            Op::Return(_) | Op::Throw => {}
+            Op::Return(_) => returns[b] = true,
+            Op::Throw => {}
             _ => succ[b].extend(fall),
         }
     }
@@ -283,8 +324,8 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
                 }
                 LockOp::Release(l) => {
                     // Only a named unlock releases; an untracked one cannot be matched.
-                    if let Some(name) = l.as_ref().map(|l| l.name()) {
-                        if let Some((lock, enter)) = st.pop(Some(&name)) {
+                    if let Some(l) = l {
+                        if let Some((lock, enter)) = st.release(&l.name(), l) {
                             if let Some(f) = emit.as_deref_mut() {
                                 f(Event::Release { lock: &lock, line, enter });
                             }
@@ -292,8 +333,25 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
                     }
                 }
                 LockOp::Call => {
-                    if let (Some(f), Op::Invoke(inv)) = (emit.as_deref_mut(), &insn.op) {
+                    let Op::Invoke(inv) = &insn.op else { continue };
+                    if let Some(f) = emit.as_deref_mut() {
                         f(Event::Call { inv, held: &st.locks, line });
+                    }
+                    // A helper's net effect: it may release for us, or return holding.
+                    if let Some(eff) = effects.get(&inv.key()) {
+                        for r in &eff.releases {
+                            if let Some((lock, enter)) = st.release(&r.name(), r) {
+                                if let Some(f) = emit.as_deref_mut() {
+                                    f(Event::Release { lock: &lock, line, enter });
+                                }
+                            }
+                        }
+                        for a in &eff.acquires {
+                            if let Some(f) = emit.as_deref_mut() {
+                                f(Event::Acquire { lock: a, line, held: &st.locks });
+                            }
+                            st.push(a.clone(), line);
+                        }
                     }
                 }
                 LockOp::None => {}
@@ -301,7 +359,7 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
         }
     };
     let mut inn: Vec<Option<State>> = vec![None; nb];
-    inn[0] = Some(State { locks: entry.to_vec(), enters: vec![None; entry.len()] });
+    inn[0] = Some(State { locks: entry.to_vec(), enters: vec![None; entry.len()], unmatched: Vec::new() });
     let mut queued = vec![false; nb];
     let mut work: VecDeque<usize> = VecDeque::from([0]);
     queued[0] = true;
@@ -329,18 +387,63 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
         }
     }
 
-    // 4. Replay each reachable block from its converged entry state, in order.
+    // 4. Replay each reachable block from its converged entry state, in order, and
+    //    collect the out-states at returns.
+    let mut outs = Vec::new();
     for (b, st) in inn.iter().enumerate() {
-        if let Some(st) = st {
-            let mut st = st.clone();
-            transfer(&mut st, b, Some(&mut f));
+        let Some(st) = st else { continue };
+        let mut st = st.clone();
+        transfer(&mut st, b, emit.as_deref_mut());
+        if returns[b] {
+            outs.push(st);
         }
     }
+    outs
+}
+
+/// A method's own net lock effect, given its callees' effects: the nameable locks
+/// still held on every return (none were held on entry, so all were taken inside)
+/// and the named releases that matched nothing on every return.
+fn effect_of(m: &Method, effects: &Effects) -> Effect {
+    let outs = run::<NoEmit>(m, &[], effects, None);
+    let Some(first) = outs.first() else { return Effect::default() };
+    let all = |pick: &dyn Fn(&State) -> Vec<Lock>| -> Vec<Lock> {
+        let mut acc: Vec<Lock> = pick(first).into_iter().filter(|l| !l.is_opaque()).collect();
+        for o in &outs[1..] {
+            let names: HashSet<String> = pick(o).iter().map(|l| l.name()).collect();
+            acc.retain(|l| names.contains(&l.name()));
+        }
+        acc.sort_by_key(|l| l.name());
+        acc.dedup_by_key(|l| l.name());
+        acc
+    };
+    Effect { acquires: all(&|s| s.locks.clone()), releases: all(&|s| s.unmatched.clone()) }
+}
+
+/// Net lock effects of every method, solved to a fixpoint so a helper that calls a
+/// helper composes. Only methods with a non-empty effect appear.
+pub(super) fn effects(dex: &Dex) -> Effects {
+    let methods: Vec<&Method> = dex.classes.iter().flat_map(|c| c.methods.iter()).collect();
+    let mut cur: Effects = HashMap::default();
+    for _ in 0..MAX_ROUNDS {
+        let next: Effects = methods
+            .par_iter()
+            .filter_map(|m| {
+                let e = effect_of(m, &cur);
+                (!e.acquires.is_empty() || !e.releases.is_empty()).then(|| (m.key(), e))
+            })
+            .collect();
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
 }
 
 /// [`walk`] restricted to calls: `on_call(invoke, held, line)`.
-pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &[Lock], mut on_call: F) {
-    walk(m, entry, |e| {
+pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &[Lock], effects: &Effects, mut on_call: F) {
+    walk(m, entry, effects, |e| {
         if let Event::Call { inv, held, line } = e {
             on_call(inv, held, line);
         }
@@ -388,6 +491,7 @@ pub(super) fn entry_held(dex: &Dex, closed_world: bool) -> HashMap<String, Vec<L
         None
     };
 
+    let eff = effects(dex);
     let mut entry: HashMap<String, Vec<Lock>> = HashMap::default();
     let empty: Vec<Lock> = Vec::new();
     for _round in 0..MAX_ROUNDS {
@@ -399,7 +503,7 @@ pub(super) fn entry_held(dex: &Dex, closed_world: bool) -> HashMap<String, Vec<L
             .map(|m| {
                 let seed = entry.get(&m.key()).unwrap_or(&empty);
                 let mut out = Vec::new();
-                scan(m, seed, |inv, held, _line| {
+                scan(m, seed, &eff, |inv, held, _line| {
                     if let Some(k) = target(inv) {
                         out.push((k, held.to_vec()));
                     }

@@ -102,8 +102,14 @@ pub fn query(idx: &Index, q: &Query, depth: u8, w: &mut impl Write) -> Result<()
         }
         Query::Cycles => {
             let inv = idx.inversions();
-            writeln!(w, "{} lock pair(s) acquired in both orders (tightest first):", inv.len())?;
-            for (a, b) in inv.iter().take(50) {
+            let ungated = inv.iter().filter(|(_, _, g)| g.is_none()).count();
+            writeln!(
+                w,
+                "{} lock pair(s) acquired in both orders: {ungated} with no common outer lock, {} gated (both orders taken under one lock)",
+                inv.len(),
+                inv.len() - ungated
+            )?;
+            for (a, b, _) in inv.iter().filter(|(_, _, g)| g.is_none()).take(40) {
                 writeln!(w, "\n  {}  <->  {}", idx.locks[a.from as usize], idx.locks[a.to as usize])?;
                 for e in [a, b] {
                     writeln!(
@@ -118,8 +124,25 @@ pub fn query(idx: &Index, q: &Query, depth: u8, w: &mut impl Write) -> Result<()
                     )?;
                 }
             }
-            if inv.len() > 50 {
-                writeln!(w, "\n  ... {} more", inv.len() - 50)?;
+            if ungated > 40 {
+                writeln!(w, "\n  ... {} more ungated", ungated - 40)?;
+            }
+            if inv.len() > ungated {
+                writeln!(w, "\ngated (both orders occur under a common outer lock, so they serialize):")?;
+                for (a, b, gate) in inv.iter().filter(|(_, _, g)| g.is_some()).take(30) {
+                    writeln!(
+                        w,
+                        "  {}  <->  {}   under {}   ({}x / {}x)",
+                        short(&idx.locks[a.from as usize]),
+                        short(&idx.locks[a.to as usize]),
+                        short(&idx.locks[gate.expect("gated") as usize]),
+                        a.count,
+                        b.count
+                    )?;
+                }
+                if inv.len() - ungated > 30 {
+                    writeln!(w, "  ... {} more gated", inv.len() - ungated - 30)?;
+                }
             }
             let cyc = idx.cycles();
             writeln!(w, "\n{} strongly connected group(s) in the lock-order graph:", cyc.len())?;
