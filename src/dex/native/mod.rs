@@ -37,7 +37,7 @@ const ACC_FINAL: u32 = 0x10;
 const ACC_VOLATILE: u32 = 0x40;
 
 /// A parsed code_item: `(registers, ins, decoded instructions, address→line)`.
-type CodeItem = (u32, u32, Vec<Insn>, Vec<(u32, u32)>);
+type CodeItem = (u32, u32, Vec<Insn>, Vec<(u32, u32)>, Vec<(u32, u32, u32)>);
 
 // --- instruction widths (code units) --------------------------------------
 const fn build_widths() -> [u8; 256] {
@@ -62,6 +62,26 @@ const fn build_widths() -> [u8; 256] {
     w
 }
 const WIDTHS: [u8; 256] = build_widths();
+
+/// Absolute code-unit offset of a branch relative to instruction `i`.
+fn rel(i: usize, off: i32) -> u32 {
+    (i as i64 + off as i64).max(0) as u32
+}
+
+/// Case targets of a switch at `i`, read from its payload; empty if malformed.
+fn switch_targets(u: &[u16], i: usize, packed: bool) -> Vec<u32> {
+    let rel_off = (u[i + 1] as u32 | (u[i + 2] as u32) << 16) as i32;
+    let p = i as i64 + rel_off as i64;
+    if p < 0 || p as usize + 2 > u.len() {
+        return Vec::new();
+    }
+    let p = p as usize;
+    let size = u[p + 1] as usize;
+    let i32_at = |k: usize| -> Option<i32> { u.get(k + 1).map(|hi| (u[k] as u32 | (*hi as u32) << 16) as i32) };
+    // packed: ident, size, first_key(2), targets(2*size); sparse: ident, size, keys(2*size), targets(2*size)
+    let first = if packed { p + 4 } else { p + 2 + 2 * size };
+    (0..size).filter_map(|k| i32_at(first + 2 * k)).map(|t| rel(i, t)).collect()
+}
 
 fn insn_width(insns: &[u16], i: usize) -> Option<usize> {
     let u0 = *insns.get(i)?;
@@ -290,8 +310,8 @@ impl<'a> Section<'a> {
                 let access = rd.uleb128()?;
                 let code_off = rd.uleb128()? as usize;
                 let (mclass, name, sig) = self.method(method_idx)?;
-                let (registers, ins, insns, positions) =
-                    if code_off == 0 { (0, 0, Vec::new(), Vec::new()) } else { self.parse_code(code_off)? };
+                let (registers, ins, insns, positions, catches) =
+                    if code_off == 0 { (0, 0, Vec::new(), Vec::new(), Vec::new()) } else { self.parse_code(code_off)? };
                 methods.push(Method {
                     class: mclass,
                     name,
@@ -301,7 +321,7 @@ impl<'a> Section<'a> {
                     ins,
                     insns,
                     positions,
-                    catches: Vec::new(), // unused by the resolve path
+                    catches,
                     source_file: source_file.map(str::to_string),
                 });
             }
@@ -346,7 +366,39 @@ impl<'a> Section<'a> {
 
         let positions =
             if debug_info_off == 0 { Vec::new() } else { self.debug_positions(debug_info_off).unwrap_or_default() };
-        Ok((registers, ins, insns, positions))
+        let tries_size = r.u16_at(off + 6)? as usize;
+        let catches = if tries_size == 0 {
+            Vec::new()
+        } else {
+            let tries_off = insns_start + insns_size * 2 + if insns_size % 2 == 1 { 2 } else { 0 };
+            self.catches(tries_off, tries_size).unwrap_or_default()
+        };
+        Ok((registers, ins, insns, positions, catches))
+    }
+
+    /// The try items and their encoded handlers: every `(start, end, handler)` in
+    /// code units, catch-all included. `tries_off` is the (4-aligned) try list.
+    fn catches(&self, tries_off: usize, tries_size: usize) -> Result<Vec<(u32, u32, u32)>> {
+        let r = &self.r;
+        let list_off = tries_off + tries_size * 8;
+        let mut out = Vec::new();
+        for t in 0..tries_size {
+            let base = tries_off + t * 8;
+            let start = r.u32_at(base)?;
+            let count = r.u16_at(base + 4)? as u32;
+            let handler_off = r.u16_at(base + 6)? as usize;
+            let mut h = Reader::new(r.data);
+            h.pos = list_off + handler_off;
+            let size = h.sleb128()?;
+            for _ in 0..size.unsigned_abs() {
+                let _type_idx = h.uleb128()?;
+                out.push((start, start + count, h.uleb128()?));
+            }
+            if size <= 0 {
+                out.push((start, start + count, h.uleb128()?));
+            }
+        }
+        Ok(out)
     }
 
     /// Map one instruction to the model `Op`, matching the textual dexdump parser.
@@ -369,6 +421,14 @@ impl<'a> Section<'a> {
             0x1c => Op::ConstClass { dst: aa, class: self.type_dotted(u[i + 1] as u32) },
             0x22 => Op::NewInstance { dst: aa, class: self.type_dotted(u[i + 1] as u32) },
             0x27 => Op::Throw,
+            // goto (+AA), goto/16 (+AAAA), goto/32 (+AAAAAAAA): signed code-unit offsets.
+            0x28 => Op::Goto(rel(i, (aa as u8) as i8 as i32)),
+            0x29 => Op::Goto(rel(i, u[i + 1] as i16 as i32)),
+            0x2a => Op::Goto(rel(i, (u[i + 1] as u32 | (u[i + 2] as u32) << 16) as i32)),
+            // packed-switch / sparse-switch: targets live in a payload at +BBBBBBBB.
+            0x2b | 0x2c => Op::Switch(switch_targets(u, i, op == 0x2b)),
+            // if-test vA, vB, +CCCC / if-testz vAA, +BBBB
+            0x32..=0x3d => Op::Branch(rel(i, u[i + 1] as i16 as i32)),
             0x52..=0x58 => {
                 let (class, field, ty) = self.field(u[i + 1] as u32)?;
                 Op::Iget { dst: a, base: b, class, field, ty: Some(ty) }

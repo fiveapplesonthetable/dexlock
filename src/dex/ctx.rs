@@ -223,34 +223,50 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                 canon.insert(g, c.clone());
                 c
             };
-            let mut open: Vec<(String, String, u32, Vec<String>)> = Vec::new(); // (ground, canon, enter, held)
-            let mut spans = Vec::new();
+            // spans keyed by (canonical lock, enter line): exit = furthest observed
+            // release (a block with several exits releases on each path).
+            let mut spans_at: HashMap<(String, u32), (Option<u32>, Vec<String>)> = HashMap::default();
+            let mut order: Vec<(String, u32)> = Vec::new();
             let mut calls = Vec::new();
+            let named = |held: &[Lock], line: u32, name_of: &mut dyn FnMut(&Lock, u32) -> String| -> Vec<String> {
+                held.iter().map(|l| name_of(l, line)).filter(|n| !n.starts_with("?@")).collect()
+            };
             flow::walk(m, &[], |e| match e {
-                Event::Acquire { lock, line } => {
+                Event::Acquire { lock, line, held } => {
                     let line = line.unwrap_or(NO_LINE);
                     let c = name_of(lock, line);
-                    let held: Vec<String> = open.iter().map(|o| o.1.clone()).collect();
-                    open.push((lock.name(), c, line, held));
+                    if c.starts_with("?@") {
+                        return;
+                    }
+                    let held = named(held, line, &mut name_of);
+                    let k = (c, line);
+                    if let std::collections::hash_map::Entry::Vacant(v) = spans_at.entry(k.clone()) {
+                        order.push(k);
+                        v.insert((None, held));
+                    }
                 }
-                Event::Release { lock, line } => {
-                    let g = lock.name();
-                    let pos = open.iter().rposition(|o| o.0 == g).or(if open.is_empty() { None } else { Some(open.len() - 1) });
-                    if let Some(p) = pos {
-                        let (_, c, enter, held) = open.remove(p);
+                Event::Release { lock, line, enter } => {
+                    let Some(enter) = enter else { return };
+                    let c = name_of(lock, enter);
+                    if let Some(sp) = spans_at.get_mut(&(c, enter)) {
                         // Exclusive exit; a block opened and closed on one line still covers it.
-                        spans.push((c, enter, line.unwrap_or(NO_LINE).max(enter + 1), held));
+                        let x = line.unwrap_or(NO_LINE).max(enter + 1);
+                        sp.0 = Some(sp.0.map_or(x, |e| e.max(x)));
                     }
                 }
                 Event::Call { inv, held, line } => {
                     let line = line.unwrap_or(NO_LINE);
-                    let held: Vec<String> = held.iter().filter(|l| !l.is_opaque()).map(|l| name_of(l, line)).collect();
+                    let held = named(held, line, &mut name_of);
                     calls.push((inv.class.clone(), inv.name.clone(), inv.sig.clone(), inv.kind, line, held));
                 }
             });
-            for (_, c, enter, held) in open {
-                spans.push((c, enter, TO_END, held));
-            }
+            let spans = order
+                .into_iter()
+                .map(|k| {
+                    let (exit, held) = spans_at.remove(&k).expect("recorded");
+                    (k.0, k.1, exit.unwrap_or(TO_END), held)
+                })
+                .collect();
             Scanned { spans, calls }
         })
         .collect();
@@ -347,6 +363,8 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
     // Static target: a class at or above `class` declaring name:sig.
     let mut static_memo: HashMap<(String, String), Option<u32>> = HashMap::default();
 
+    let class_set: HashSet<&str> = dex.classes.iter().map(|c| c.descriptor.as_str()).collect();
+    let (mut external, mut unlinked) = (0usize, 0usize);
     let mut calls: Vec<Call> = Vec::with_capacity(raw_calls.len());
     for RawCall { caller, class, sig: sigk, kind, line, held } in raw_calls {
         let exact = id_of.get(&format!("{class}.{sigk}")).copied();
@@ -378,9 +396,20 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                 }
             }
         }
+        let none = targets.is_empty();
         calls.push(Call { caller, line, held, targets });
+        if none {
+            if class_set.contains(class.as_str()) { unlinked += 1 } else { external += 1 }
+        }
     }
-    log::debug!("ctx: resolve {:.2?} ({} calls)", t0.elapsed(), calls.len());
+    log::info!(
+        "ctx: {} call sites: {} linked, {} into classes outside the inputs, {} unlinked (wide dispatch or missing declaration)",
+        calls.len(),
+        calls.len() - external - unlinked,
+        external,
+        unlinked
+    );
+    log::debug!("ctx: resolve {:.2?}", t0.elapsed());
 
     // Callers CSR.
     let mut deg = vec![0u32; n + 1];

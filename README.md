@@ -307,8 +307,8 @@ calls that reach a private method through a synthetic accessor bridge (which has
 unique signature). Its soundness rests on the inputs being complete: pass *all*
 relevant jars/apks, because a caller in an omitted artifact would be missed and could
 turn the must-intersection into a false positive. On `services.jar` + `framework.jar`
-it lifts the count from 693 to 833. It is off by default; the default (private-only)
-inference needs no whole-program assumption.
+it lifts the count (default inference finds 1,024 on those two jars). It is off by
+default; the default (private-only) inference needs no whole-program assumption.
 
 Two caveats it cannot resolve statically: a binder whose service lives in the *same*
 process (e.g. a system_server-internal AIDL) is a local call, not a real IPC; and a
@@ -354,7 +354,14 @@ them.
 
 How it works. Every method is walked once for its lock *spans* (each acquisition
 with the line range it is held over) and its call sites, each tagged with the locks
-held there. Call sites link to their static target and, for virtual/interface
+held there. That walk is control-flow aware: a `synchronized` block with an early
+`return` compiles to a `monitor-exit` on that path before the block's remaining
+code, and every block has a catch-all handler that exits the monitor and rethrows,
+so the held set is solved as a forward dataflow over basic blocks (branch, switch,
+fall-through, and exception edges) rather than read off a linear scan — which
+misreads everything after the first textual exit as unlocked. `tryLock` is held on
+its success path only; `readLock()`/`writeLock()` views are the parent lock in that
+mode. Call sites link to their static target and, for virtual/interface
 dispatch with a small implementation set (`--cha-cap`, default 16), to each
 override; a broad interface such as `Runnable.run` is left unlinked on purpose,
 since "every lock any caller holds" is noise. Lock names are the canonical

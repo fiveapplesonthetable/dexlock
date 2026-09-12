@@ -64,6 +64,8 @@ pub enum Op {
     Goto(u32),
     /// `if-*` — conditional branch to a code offset (plus the implicit fall-through).
     Branch(u32),
+    /// `packed-switch` / `sparse-switch` — the case targets (plus the fall-through).
+    Switch(Vec<u32>),
     /// `throw` — a path terminator (the handler is a separate block).
     Throw,
     /// defines `dst` with an opaque value (clears any lock tracked there).

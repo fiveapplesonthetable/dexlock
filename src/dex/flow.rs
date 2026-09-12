@@ -12,13 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Held-lock dataflow shared by the hazard analyses.
+//! Held-lock dataflow shared by the hazard analyses and the context index.
 //!
-//! [`scan`] is the intra-procedural pass: it walks a method maintaining the set of
-//! locks held at each point (monitor-enter/exit, j.u.c `Lock.lock`/`unlock`, and an
-//! `entry` seed) and reports the held set at every call. [`entry_held`] lifts that
-//! past the caller-holds-the-lock convention (`…Locked` / `@GuardedBy` helpers,
-//! where the lock is taken one frame up): it infers the locks held on entry to each
+//! [`walk`] is the intra-procedural pass: which locks are held at every acquire,
+//! release, and call in a method. It is control-flow aware. A `synchronized` block
+//! with an early `return` compiles to a `monitor-exit` on that path *before* the
+//! block's remaining code, and every block gets a catch-all handler that exits the
+//! monitor and rethrows; a linear scan pops the lock at the first textual exit and
+//! misreads everything after it as unlocked. So the method is split into basic
+//! blocks (branch, switch, return/throw, and try-range boundaries), the held set is
+//! solved forward over the block graph — branch, switch, fall-through, and
+//! exception edges — and events are then replayed per block from its converged
+//! entry state. The join is intersection: Java's structured locking makes the
+//! monitor set path-independent, and for `tryLock` (acquired on the success path
+//! only) intersection keeps the lock from leaking past the join.
+//!
+//! Register-to-lock tracking (what object a `monitor-enter`/`lock()` operand names)
+//! stays a linear pass, as in resolution; the operand is defined immediately
+//! before its use, so that is exact where it matters and byte-verified there.
+//!
+//! [`entry_held`] lifts the intra pass past the caller-holds-the-lock convention
+//! (`…Locked` / `@GuardedBy` helpers): it infers the locks held on entry to each
 //! *private* method as the intersection of the held sets at all of its call sites,
 //! solved as a monotone fixpoint over the call graph.
 //!
@@ -46,6 +60,7 @@ use crate::dex::juc::{self, LockCall};
 use crate::dex::model::*;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 const ACC_PRIVATE: u32 = 0x2;
 /// Cap on fixpoint rounds. The lock universe is finite and entry sets grow
@@ -55,19 +70,70 @@ const MAX_ROUNDS: usize = 16;
 
 /// One step of the held-lock walk over a method.
 pub(super) enum Event<'a> {
-    /// A lock was taken (monitor-enter / `Lock.lock`), grounded, at `line`.
-    Acquire { lock: &'a Lock, line: Option<u32> },
-    /// A lock was released (monitor-exit / `unlock`), at `line`.
-    Release { lock: &'a Lock, line: Option<u32> },
+    /// A lock was taken (monitor-enter / `Lock.lock`), grounded, at `line`, with
+    /// `held` the locks already held there.
+    Acquire { lock: &'a Lock, line: Option<u32>, held: &'a [Lock] },
+    /// A lock was released (monitor-exit / `unlock`) at `line`; `enter` is the line
+    /// of the acquisition it balances (`None` for a lock held on entry).
+    Release { lock: &'a Lock, line: Option<u32>, enter: Option<u32> },
     /// A non-lock call, with every lock held at that point (grounded).
     Call { inv: &'a Invoke, held: &'a [Lock], line: Option<u32> },
 }
 
-/// Walk `m` maintaining the held-lock set (seeded with `entry`), reporting each
-/// acquire, release, and call in order. Monitor-enter/exit and j.u.c
-/// `Lock.lock`/`unlock` adjust the held set; a release pops the matching lock, or
-/// the innermost one when the operand register is untracked.
+/// The lock-relevant effect of one instruction, from the linear register pass.
+enum LockOp {
+    Enter(Lock),
+    Exit(Option<Lock>),
+    Acquire(Lock),
+    Release(Option<Lock>),
+    Call,
+    None,
+}
+
+/// Held-lock stack: the locks plus the line each was taken on (`None` = on entry).
+#[derive(Clone, PartialEq)]
+struct State {
+    locks: Vec<Lock>,
+    enters: Vec<Option<u32>>,
+}
+
+impl State {
+    fn push(&mut self, l: Lock, line: Option<u32>) {
+        self.locks.push(l);
+        self.enters.push(line);
+    }
+    /// Pop the innermost lock named `name` (or the innermost of all when `None`).
+    fn pop(&mut self, name: Option<&str>) -> Option<(Lock, Option<u32>)> {
+        let pos = match name {
+            Some(n) => self.locks.iter().rposition(|h| h.name() == n)?,
+            None => self.locks.len().checked_sub(1)?,
+        };
+        Some((self.locks.remove(pos), self.enters.remove(pos)))
+    }
+    /// Intersection by name, keeping this state's order. True if it shrank.
+    fn meet(&mut self, other: &State) -> bool {
+        let before = self.locks.len();
+        let keep: Vec<bool> = self.locks.iter().map(|l| other.locks.iter().any(|o| o.name() == l.name())).collect();
+        let mut i = 0;
+        self.locks.retain(|_| { let k = keep[i]; i += 1; k });
+        let mut i = 0;
+        self.enters.retain(|_| { let k = keep[i]; i += 1; k });
+        self.locks.len() != before
+    }
+}
+
+/// Walk `m` reporting each acquire, release, and call with the locks held there,
+/// seeded with `entry` (locks held on entry to the method).
 pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
+    let n = m.insns.len();
+    if n == 0 {
+        return;
+    }
+    let key = m.key();
+    let ground = |l: &Lock| l.ground(&m.class, &key);
+    let opaque = |off: u32| Lock::new(Root::Opaque(format!("{key}+{off:04x}")));
+
+    // 1. Linear register pass: the lock operand of every lock-shaped instruction.
     let mut regs: HashMap<Reg, Lock> = HashMap::default();
     if let Some(t) = m.this_reg() {
         regs.insert(t, Lock::new(Root::This));
@@ -75,21 +141,10 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
             regs.insert(t + j, Lock::new(Root::Param(j)));
         }
     }
-    let ground = |l: &Lock| l.ground(&m.class, &m.key());
-    let mut held: Vec<Lock> = entry.to_vec();
-    // Release: drop the named lock if held (innermost match), else the innermost.
-    fn release<F: FnMut(Event)>(held: &mut Vec<Lock>, name: Option<String>, line: Option<u32>, f: &mut F) {
-        let pos = match name.and_then(|n| held.iter().rposition(|h| h.name() == n)) {
-            Some(p) => p,
-            None if !held.is_empty() => held.len() - 1,
-            None => return,
-        };
-        let l = held.remove(pos);
-        f(Event::Release { lock: &l, line });
-    }
-
+    let mut last_ret: Option<Lock> = None;
+    let mut ops: Vec<LockOp> = Vec::with_capacity(n);
     for insn in &m.insns {
-        let line = m.line_at(insn.offset);
+        let mut op = LockOp::None;
         match &insn.op {
             Op::Iget { dst, class, field, .. } => {
                 regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
@@ -104,35 +159,181 @@ pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
                 Some(v) => { regs.insert(*dst, v); }
                 None => { regs.remove(dst); }
             },
-            Op::NewInstance { dst, .. } | Op::MoveResult { dst } | Op::Def(dst) => {
+            Op::MoveResult { dst } => match last_ret.take() {
+                Some(v) => { regs.insert(*dst, v); }
+                None => { regs.remove(dst); }
+            },
+            Op::NewInstance { dst, .. } | Op::Def(dst) => {
                 regs.remove(dst);
             }
+            // An unknown operand still pushes (an opaque) so exits stay balanced.
             Op::MonitorEnter(r) => {
-                if let Some(l) = regs.get(r).cloned() {
-                    let g = ground(&l);
-                    f(Event::Acquire { lock: &g, line });
-                    held.push(g);
+                op = LockOp::Enter(regs.get(r).map(ground).unwrap_or_else(|| opaque(insn.offset)));
+            }
+            Op::MonitorExit(r) => op = LockOp::Exit(regs.get(r).map(ground)),
+            Op::Invoke(inv) => {
+                last_ret = None;
+                let arg0 = inv.args.first().and_then(|r| regs.get(r));
+                match juc::classify(&inv.class, &inv.name) {
+                    // `readLock()` / `writeLock()` return a mode-tagged view of the
+                    // same lock, so `rw.readLock().lock()` acquires `rw` (read).
+                    Some(LockCall::ReadView) => last_ret = arg0.map(|l| l.with_mode(Mode::Read)),
+                    Some(LockCall::WriteView) => last_ret = arg0.map(|l| l.with_mode(Mode::Write)),
+                    Some(LockCall::Acquire | LockCall::TryAcquire) => {
+                        op = LockOp::Acquire(arg0.map(ground).unwrap_or_else(|| opaque(insn.offset)));
+                    }
+                    Some(LockCall::Release) => op = LockOp::Release(arg0.map(ground)),
+                    None => op = LockOp::Call,
                 }
             }
-            Op::MonitorExit(r) => {
-                let name = regs.get(r).map(|l| ground(l).name());
-                release(&mut held, name, line, &mut f);
+            _ => {}
+        }
+        ops.push(op);
+    }
+
+    // 2. Basic blocks over the instruction list.
+    let idx_of = |off: u32| -> usize { m.insns.partition_point(|i| i.offset < off) };
+    let mut leader = vec![false; n + 1];
+    leader[0] = true;
+    for (i, insn) in m.insns.iter().enumerate() {
+        match &insn.op {
+            Op::Goto(t) | Op::Branch(t) => {
+                leader[idx_of(*t)] = true;
+                leader[i + 1] = true;
             }
-            Op::Invoke(inv) => match juc::classify(&inv.class, &inv.name) {
-                Some(LockCall::Acquire | LockCall::TryAcquire) => {
-                    if let Some(l) = inv.args.first().and_then(|r| regs.get(r)).cloned() {
-                        let g = ground(&l);
-                        f(Event::Acquire { lock: &g, line });
-                        held.push(g);
+            Op::Switch(ts) => {
+                for t in ts {
+                    leader[idx_of(*t)] = true;
+                }
+                leader[i + 1] = true;
+            }
+            Op::Return(_) | Op::Throw => leader[i + 1] = true,
+            _ => {}
+        }
+    }
+    for &(s, e, h) in &m.catches {
+        leader[idx_of(s)] = true;
+        leader[idx_of(e)] = true;
+        leader[idx_of(h)] = true;
+    }
+    let mut blocks: Vec<(usize, usize)> = Vec::new();
+    let mut block_of = vec![0usize; n];
+    let mut start = 0;
+    for (i, &lead) in leader.iter().enumerate().skip(1) {
+        if i == n || lead {
+            blocks.push((start, i));
+            for b in block_of.iter_mut().take(i).skip(start) {
+                *b = blocks.len() - 1;
+            }
+            start = i;
+        }
+    }
+    let nb = blocks.len();
+    let blk = |off: u32| -> Option<usize> {
+        let i = idx_of(off);
+        (i < n).then(|| block_of[i])
+    };
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    let mut exc: Vec<Vec<usize>> = vec![Vec::new(); nb];
+    for (b, &(_, end)) in blocks.iter().enumerate() {
+        let fall = (b + 1 < nb).then_some(b + 1);
+        match &m.insns[end - 1].op {
+            Op::Goto(t) => succ[b].extend(blk(*t)),
+            Op::Branch(t) => {
+                succ[b].extend(blk(*t));
+                succ[b].extend(fall);
+            }
+            Op::Switch(ts) => {
+                succ[b].extend(ts.iter().filter_map(|t| blk(*t)));
+                succ[b].extend(fall);
+            }
+            Op::Return(_) | Op::Throw => {}
+            _ => succ[b].extend(fall),
+        }
+    }
+    for &(s, e, h) in &m.catches {
+        let (si, ei) = (idx_of(s), idx_of(e));
+        let Some(hb) = blk(h) else { continue };
+        for (b, &(bs, be)) in blocks.iter().enumerate() {
+            if bs < ei && be > si && !exc[b].contains(&hb) {
+                exc[b].push(hb);
+            }
+        }
+    }
+
+    // 3. Forward dataflow of the held stack, intersection join.
+    let transfer = |st: &mut State, b: usize, mut emit: Option<&mut F>| {
+        let (bs, be) = blocks[b];
+        for (insn, op) in m.insns[bs..be].iter().zip(&ops[bs..be]) {
+            let line = m.line_at(insn.offset);
+            match op {
+                LockOp::Enter(l) | LockOp::Acquire(l) => {
+                    if let Some(f) = emit.as_deref_mut() {
+                        f(Event::Acquire { lock: l, line, held: &st.locks });
+                    }
+                    st.push(l.clone(), line);
+                }
+                LockOp::Exit(l) => {
+                    let name = l.as_ref().map(|l| l.name());
+                    if let Some((lock, enter)) = st.pop(name.as_deref()) {
+                        if let Some(f) = emit.as_deref_mut() {
+                            f(Event::Release { lock: &lock, line, enter });
+                        }
                     }
                 }
-                Some(LockCall::Release) => {
-                    let name = inv.args.first().and_then(|r| regs.get(r)).map(|l| ground(l).name());
-                    release(&mut held, name, line, &mut f);
+                LockOp::Release(l) => {
+                    // Only a named unlock releases; an untracked one cannot be matched.
+                    if let Some(name) = l.as_ref().map(|l| l.name()) {
+                        if let Some((lock, enter)) = st.pop(Some(&name)) {
+                            if let Some(f) = emit.as_deref_mut() {
+                                f(Event::Release { lock: &lock, line, enter });
+                            }
+                        }
+                    }
                 }
-                _ => f(Event::Call { inv, held: &held, line }),
-            },
-            _ => {}
+                LockOp::Call => {
+                    if let (Some(f), Op::Invoke(inv)) = (emit.as_deref_mut(), &insn.op) {
+                        f(Event::Call { inv, held: &st.locks, line });
+                    }
+                }
+                LockOp::None => {}
+            }
+        }
+    };
+    let mut inn: Vec<Option<State>> = vec![None; nb];
+    inn[0] = Some(State { locks: entry.to_vec(), enters: vec![None; entry.len()] });
+    let mut queued = vec![false; nb];
+    let mut work: VecDeque<usize> = VecDeque::from([0]);
+    queued[0] = true;
+    while let Some(b) = work.pop_front() {
+        queued[b] = false;
+        let entry_st = inn[b].clone().expect("queued blocks have a state");
+        let mut out = entry_st.clone();
+        transfer(&mut out, b, None);
+        // Normal successors see the block's out state; handlers see its entry state
+        // (a try range starts at a block boundary, so the locks held across it are
+        // exactly those held on entry to each block it covers).
+        let edges = succ[b].iter().map(|&s| (s, &out)).chain(exc[b].iter().map(|&h| (h, &entry_st)));
+        for (s, st) in edges {
+            let changed = match &mut inn[s] {
+                None => {
+                    inn[s] = Some(st.clone());
+                    true
+                }
+                Some(cur) => cur.meet(st),
+            };
+            if changed && !queued[s] {
+                queued[s] = true;
+                work.push_back(s);
+            }
+        }
+    }
+
+    // 4. Replay each reachable block from its converged entry state, in order.
+    for (b, st) in inn.iter().enumerate() {
+        if let Some(st) = st {
+            let mut st = st.clone();
+            transfer(&mut st, b, Some(&mut f));
         }
     }
 }

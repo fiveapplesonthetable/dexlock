@@ -156,7 +156,7 @@ pub(super) fn extract(m: &Method, value_summaries: &HashMap<String, Lock>) -> Su
                 let lock = regs.get(r).cloned().unwrap_or_else(|| opaque(insn.offset));
                 s.acq_sites.push((lock, line));
             }
-            Op::MonitorExit(_) | Op::Goto(_) | Op::Branch(_) | Op::Throw | Op::Other => {}
+            Op::MonitorExit(_) | Op::Goto(_) | Op::Branch(_) | Op::Switch(_) | Op::Throw | Op::Other => {}
         }
     }
 

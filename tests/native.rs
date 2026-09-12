@@ -154,6 +154,45 @@ fn fixture_ctx_binder_sites() {
     );
 }
 
+/// Control-flow-aware held-lock tracking over `fixtures/cfg.dex`: the locks held at
+/// each helper call are exactly those of its enclosing block, across an early
+/// return, a catch handler, try/finally, a switch, a loop, a successful `tryLock`,
+/// and a read-write lock view.
+#[test]
+fn fixture_cfg_held() {
+    let bytes = include_bytes!("fixtures/cfg.dex");
+    let d = dex::parse_dex_blob(bytes).expect("parse fixture");
+    let idx = dex::ctx::build(&d, &dex::ctx::Options::default());
+    let held_at = |callee: &str| -> Vec<String> {
+        let key = format!("t.Cfg.{callee}:()V");
+        let t = idx.find_methods(&key);
+        assert_eq!(t.len(), 1, "{key}");
+        let mut v: Vec<String> = idx
+            .calls
+            .iter()
+            .filter(|c| c.targets.contains(&t[0]))
+            .flat_map(|c| c.held.iter().map(|&l| idx.locks[l as usize].clone()))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    let a = vec!["t.Cfg.mA".to_string()];
+    assert_eq!(held_at("after"), a, "code after an early return is still inside the block");
+    assert_eq!(held_at("outside"), Vec::<String>::new());
+    assert_eq!(held_at("inCatch"), a, "catch handler inherits the monitor");
+    assert_eq!(held_at("inFinally"), a);
+    assert_eq!(held_at("s1"), a);
+    assert_eq!(held_at("s2"), a);
+    assert_eq!(held_at("s3"), a);
+    assert_eq!(held_at("body"), a);
+    assert_eq!(held_at("tail"), Vec::<String>::new());
+    assert_eq!(held_at("inTry"), vec!["t.Cfg.mL".to_string()]);
+    assert_eq!(held_at("post"), Vec::<String>::new(), "tryLock result does not leak past the join");
+    assert_eq!(held_at("inRead"), vec!["t.Cfg.mRw.read".to_string()]);
+    assert_eq!(held_at("afterRead"), Vec::<String>::new());
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]
