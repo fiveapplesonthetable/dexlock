@@ -41,6 +41,13 @@
 //! Excluded, by definition rather than by guess: `final` and `volatile` fields,
 //! fields never written, and writes in `<init>`/`<clinit>` (a constructor runs
 //! before publication and a static initializer is serialized by the runtime).
+//!
+//! An access inside a compiler-generated accessor — the forwarder emitted so an
+//! inner class can touch an outer field — is reported at the *call sites* instead.
+//! The forwarder is not a program point anyone wrote: it carries no line number, and
+//! the locks that matter are the ones held where it is called. Such a method is
+//! recognized structurally, by having no real line table (d8 gives it a single
+//! entry of line 0) and a body of nothing but the field access, never by its name.
 
 use crate::dex::ctx::{self, Index};
 use crate::dex::flow::{self, Event};
@@ -110,30 +117,66 @@ pub fn races(dex: &Dex, opts: &Options) -> Vec<Finding> {
     let concurrent = concurrent_methods(dex, &idx);
     log::debug!("race: index + concurrency roots {:.2?}", t0.elapsed());
 
+    // The index enumerates methods in this same order, so a position is a method id
+    // in both. Method keys are not unique across merged artifacts (14k of 700k
+    // repeat on a full system image), so they cannot serve as the identity here.
     let methods: Vec<&Method> = dex.classes.iter().flat_map(|c| c.methods.iter()).collect();
-    let id_of: HashMap<String, u32> =
-        methods.iter().enumerate().map(|(i, m)| (m.key(), i as u32)).collect();
+    debug_assert_eq!(methods.len(), idx.methods.len());
     let entry = flow::entry_held(dex, false);
     let effects = flow::effects(dex);
     let empty: Vec<Lock> = Vec::new();
+
+    // Compiler-generated field accessors: no line table, and a body that does
+    // nothing but touch the field. Their accesses are attributed to their callers.
+    let forwarder: Vec<bool> = methods
+        .iter()
+        .map(|m| {
+            // d8 gives these a line table whose only entry is line 0 — the absence
+            // of a source line, not a line.
+            m.positions.iter().all(|&(_, l)| l == 0)
+                && m.insns.iter().any(|i| matches!(i.op, Op::Iget { .. } | Op::Iput { .. } | Op::Sget { .. } | Op::Sput { .. }))
+                && !m.insns.iter().any(|i| matches!(i.op, Op::Invoke(_) | Op::MonitorEnter(_) | Op::MonitorExit(_)))
+        })
+        .collect();
+    log::debug!("race: {} compiler-generated field accessors", forwarder.iter().filter(|f| **f).count());
 
     let raw: Vec<Raw> = methods
         .par_iter()
         .enumerate()
         .filter(|(_, m)| !m.name.starts_with('<'))
-        .flat_map_iter(|(_, m)| {
+        .flat_map_iter(|(id, m)| {
             let key = m.key();
-            let id = id_of[&key];
+            let id = id as u32;
             // A lock may reach this method only through a caller; with none, an
             // empty held set here is empty on every path.
             let may_free = idx.may_held(id).is_empty();
             let mut out = Vec::new();
             flow::walk(m, entry.get(&key).unwrap_or(&empty), &effects, |e| {
                 if let Event::Field { class, field, write, held, line } = e {
+                    let name = format!("{class}.{field}");
+                    if forwarder[id as usize] {
+                        // The access happens wherever the accessor is called, under
+                        // whatever is held there. With no call site there is no path
+                        // to it at all, and so nothing to report.
+                        for &k in idx.callers_of(id) {
+                            let c = &idx.calls[k as usize];
+                            let held: Vec<String> =
+                                c.held.iter().map(|&l| idx.locks[l as usize].clone()).collect();
+                            out.push(Raw {
+                                field: name.clone(),
+                                method: c.caller,
+                                line: Some(c.line),
+                                write,
+                                unlocked: idx.may_held(c.caller).is_empty() && held.is_empty(),
+                                held,
+                            });
+                        }
+                        return;
+                    }
                     let held: Vec<String> =
                         held.iter().filter(|l| !l.is_opaque()).map(|l| l.name()).collect();
                     out.push(Raw {
-                        field: format!("{class}.{field}"),
+                        field: name,
                         method: id,
                         line,
                         write,
@@ -236,11 +279,11 @@ fn concurrent_methods(dex: &Dex, idx: &Index) -> Vec<bool> {
         }
     }
 
+    // Positional ids again: the index enumerates the same methods in the same order.
     let methods: Vec<&Method> = dex.classes.iter().flat_map(|c| c.methods.iter()).collect();
-    let id_of: HashMap<&str, usize> = idx.methods.iter().enumerate().map(|(i, m)| (m.key.as_str(), i)).collect();
     let mut roots: Vec<usize> = Vec::new();
     let mut anc_memo: HashMap<&str, HashSet<&str>> = HashMap::default();
-    for m in &methods {
+    for (i, m) in methods.iter().enumerate() {
         if m.is_static() || m.name.starts_with('<') {
             continue;
         }
@@ -250,9 +293,7 @@ fn concurrent_methods(dex: &Dex, idx: &Index) -> Vec<bool> {
         let threaded = (sig == "run:()V" && (anc.contains("java.lang.Runnable") || anc.contains("java.lang.Thread")))
             || (sig == "handleMessage:(Landroid/os/Message;)V" && anc.contains("android.os.Handler"));
         if served || threaded {
-            if let Some(&i) = id_of.get(m.key().as_str()) {
-                roots.push(i);
-            }
+            roots.push(i);
         }
     }
 

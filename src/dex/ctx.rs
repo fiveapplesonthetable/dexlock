@@ -742,7 +742,7 @@ impl Index {
     }
 
     /// Call sites (indices into `calls`) that target `m`.
-    fn callers_of(&self, m: u32) -> &[u32] {
+    pub fn callers_of(&self, m: u32) -> &[u32] {
         &self.callers[self.caller_off[m as usize] as usize..self.caller_off[m as usize + 1] as usize]
     }
 

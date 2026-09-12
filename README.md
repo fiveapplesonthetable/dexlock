@@ -445,13 +445,20 @@ Point 2 is the whole difference from the first version of this pass, which was
 withdrawn. That one called an access unguarded when it merely could not *see* a
 lock, so every caller-locked `…Locked` helper was a false positive —
 `PowerManagerService.mDirty` is `@GuardedBy("mLock")` and was reported. Such a
-helper now has its caller's lock in its may set and is not reported; on
-`services.jar` + `framework.jar` the count went from 1,226 fields to 79 across the
-whole system, 20 of them with a concurrent unguarded write.
+helper now has its caller's lock in its may set and is not reported; the count went
+from 1,226 fields to 85 across the whole system, 23 of them with a concurrent
+unguarded write.
 
 Excluded by definition rather than by guess: `final` and `volatile` fields, fields
 never written, and writes in `<init>`/`<clinit>` — a constructor runs before
 publication and a static initializer is serialized by the runtime.
+
+An access inside a compiler-generated accessor — the forwarder emitted so an inner
+class can touch an outer field — is reported at the **call sites** instead. The
+forwarder is nobody's source line, and the locks that matter are the ones held where
+it is called; it is recognized structurally (no real line table, a body of nothing
+but the field access), never by its name. Without this, an inner class writing an
+outer field points at `-$$Nest$fput…` with no line to open.
 
 Each finding carries the guard, the counts (`5/6 accesses`), witness accesses for
 the discipline, and every unguarded write with its `File.java:line`:

@@ -11,6 +11,7 @@ class Race implements Runnable {
     volatile int mVol;  // same shape as mGuarded, but volatile -> excluded
     int mCtorOnly;      // read under mLock; written only by the constructor
     int mNever;         // never guarded anywhere -> no discipline to be inconsistent with
+    private int mInner; // written by an inner class, so through a generated accessor
 
     Race() {
         mCtorOnly = 1;
@@ -47,6 +48,21 @@ class Race implements Runnable {
     // NEGATIVE: no lock anywhere, so nothing is inconsistent.
     void n1() { mNever = 1; }
     void n2() { sink(mNever); }
+
+    // POSITIVE, reported at the caller: an inner class touching an outer private
+    // field goes through a compiler-generated accessor, which is no source line of
+    // anyone's. The write must be reported at Writer.run, not at the accessor.
+    void j1() { synchronized (mLock) { sink(mInner); } }
+    void j2() { synchronized (mLock) { sink(mInner); } }
+    void j3() { synchronized (mLock) { sink(mInner); } }
+    void j4() { synchronized (mLock) { mInner = 1; } }
+
+    class Writer implements Runnable {
+        @Override
+        public void run() {
+            mInner = 7;
+        }
+    }
 
     // A concurrent entry point: the unguarded write runs on another thread.
     @Override

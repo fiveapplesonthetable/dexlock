@@ -261,9 +261,11 @@ fn native_apex_matches_deapexer() {
     eprintln!("native apex reader verified on {checked} jars");
 }
 
-/// The inconsistent-locking pass over `fixtures/race.dex`. Exactly one field is
-/// reported: `mGuarded`, held under `mLock` at five of six accesses and written with
-/// no lock in `run()` — on a `Runnable`, so the write is marked concurrent. The
+/// The inconsistent-locking pass over `fixtures/race.dex`. Two fields are reported:
+/// `mGuarded`, held under `mLock` at five of six accesses and written with no lock
+/// in `run()` — on a `Runnable`, so the write is marked concurrent — and `mInner`,
+/// written by an inner class through a compiler-generated accessor, which must be
+/// reported at the caller rather than at the accessor. The
 /// field the pass exists not to misreport is `mCallerLocked`: its only write is in a
 /// private helper whose every caller holds `mLock`, so the lock is one frame up.
 /// Counted as unguarded it would clear both thresholds and be reported, as the
@@ -275,7 +277,18 @@ fn fixture_race_inconsistent_locking() {
     let f = dex::race::races(&d, &dex::race::Options::default());
 
     let fields: Vec<&str> = f.iter().map(|x| x.field.as_str()).collect();
-    assert_eq!(fields, ["t.Race.mGuarded"], "only the inconsistently locked field is reported");
+    assert_eq!(fields, ["t.Race.mGuarded", "t.Race.mInner"], "only inconsistently locked fields are reported");
+
+    // An inner class touching an outer private field goes through a generated
+    // accessor, which is nobody's source line; the write is reported where it is
+    // written, not at the accessor.
+    let inner = &f[1];
+    assert_eq!(inner.unguarded.len(), 1);
+    let iw = &inner.unguarded[0];
+    assert_eq!(iw.method, "t.Race$Writer.run:()V");
+    assert!(!iw.method.contains("$$Nest"), "attributed to the accessor, not its caller");
+    assert!(iw.line.is_some_and(|l| l > 0), "a real source line");
+    assert!(iw.concurrent);
 
     let one = &f[0];
     assert_eq!(one.guard, "t.Race.mLock");
