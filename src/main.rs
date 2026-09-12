@@ -121,6 +121,10 @@ struct CtxQueryArgs {
     /// Omit locks held more than this many call frames away.
     #[arg(long, default_value_t = 4)]
     depth: u8,
+
+    /// Emit the answer as JSON instead of a report.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -270,34 +274,40 @@ fn run_ctx(args: CtxArgs) -> Result<()> {
         }
         CtxCmd::Query(a) => {
             let idx = lockctx::load(&a.index)?;
-            let mut out = std::io::stdout().lock();
-            let mut any = false;
+            let mut queries: Vec<CtxQuery> = Vec::new();
             if let Some(at) = &a.at {
                 let (file, line) = at
                     .rsplit_once(':')
                     .and_then(|(f, l)| l.parse::<u32>().ok().map(|l| (f.to_string(), l)))
                     .ok_or_else(|| anyhow::anyhow!("--at expects File.java:LINE, got {at:?}"))?;
-                lockctx::query(&idx, &CtxQuery::At { file, line }, a.depth, &mut out)?;
-                any = true;
+                queries.push(CtxQuery::At { file, line });
             }
             if let Some(m) = &a.method {
-                lockctx::query(&idx, &CtxQuery::Method(m.clone()), a.depth, &mut out)?;
-                any = true;
+                queries.push(CtxQuery::Method(m.clone()));
             }
             if let Some(l) = &a.lock {
-                lockctx::query(&idx, &CtxQuery::Lock(l.clone()), a.depth, &mut out)?;
-                any = true;
+                queries.push(CtxQuery::Lock(l.clone()));
             }
             if a.cycles {
-                lockctx::query(&idx, &CtxQuery::Cycles, a.depth, &mut out)?;
-                any = true;
+                queries.push(CtxQuery::Cycles);
             }
             if a.binder {
-                lockctx::query(&idx, &CtxQuery::Binder, a.depth, &mut out)?;
-                any = true;
+                queries.push(CtxQuery::Binder);
             }
-            if !any {
+            if queries.is_empty() {
                 anyhow::bail!("give one of --at, --method, --lock, --cycles, --binder");
+            }
+            let mut out = std::io::stdout().lock();
+            if a.json {
+                let answers: Vec<serde_json::Value> = queries.iter().map(|q| lockctx::query_json(&idx, q, a.depth)).collect();
+                let v = if answers.len() == 1 { answers.into_iter().next().expect("one") } else { serde_json::Value::Array(answers) };
+                serde_json::to_writer(&mut out, &v)?;
+                use std::io::Write;
+                writeln!(out)?;
+            } else {
+                for q in &queries {
+                    lockctx::query(&idx, q, a.depth, &mut out)?;
+                }
             }
             Ok(())
         }

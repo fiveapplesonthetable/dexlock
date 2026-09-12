@@ -329,7 +329,7 @@ dexlock ctx query sys.ctx --at ActivityManagerService.java:4600
 dexlock ctx query sys.ctx --method ActivityManagerService.attachApplicationLocked:
 dexlock ctx query sys.ctx --lock ActivityManagerService.mProcLock
 dexlock ctx query sys.ctx --cycles                            # lock-order SCCs
-# --depth N (default 4) omits locks held more than N frames away
+# --depth N (default 4) omits locks held more than N frames away; --json for tooling
 ```
 
 A line or method query reports the locks the method itself holds at that line

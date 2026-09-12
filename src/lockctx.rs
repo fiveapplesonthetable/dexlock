@@ -2,9 +2,10 @@
 //! answer queries against it — for a source line, a method, or a lock: which locks
 //! may be held there, by what call path, and how locks order against each other.
 
-use crate::dex::ctx::{self, Hop, Index, Options};
+use crate::dex::ctx::{self, Hop, Index, OrderEdge, Options};
 use crate::dex::input;
 use anyhow::{Context, Result};
+use serde_json::{json, Value};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -285,4 +286,88 @@ fn report_lock(idx: &Index, l: u32, depth: u8, w: &mut impl Write) -> Result<()>
     }
     writeln!(w)?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Machine-readable answers
+// ---------------------------------------------------------------------------
+
+fn method_json(idx: &Index, m: u32) -> Value {
+    let r = &idx.methods[m as usize];
+    json!({ "method": r.key, "file": idx.files[r.file as usize] })
+}
+
+fn path_json(idx: &Index, path: &[Hop]) -> Value {
+    Value::Array(
+        path.iter()
+            .map(|h| json!({ "method": idx.methods[h.method as usize].key, "file": idx.files[idx.methods[h.method as usize].file as usize], "acquire": h.acquire, "call": h.call }))
+            .collect(),
+    )
+}
+
+fn edge_json(idx: &Index, e: &OrderEdge) -> Value {
+    json!({
+        "from": idx.locks[e.from as usize], "to": idx.locks[e.to as usize], "count": e.count, "dist": e.dist,
+        "method": idx.methods[e.method as usize].key, "file": idx.files[idx.methods[e.method as usize].file as usize], "line": e.line
+    })
+}
+
+fn point_json(idx: &Index, m: u32, line: u32, depth: u8) -> Value {
+    let r = &idx.methods[m as usize];
+    let held: Vec<Value> = idx
+        .intra_held(m, line)
+        .into_iter()
+        .map(|l| {
+            let at = r.spans.iter().filter(|s| s.lock == l && s.enter <= line && line < s.exit).map(|s| s.enter).next();
+            json!({ "lock": idx.locks[l as usize], "acquired_at": at })
+        })
+        .collect();
+    let may: Vec<Value> = idx
+        .may_held(m)
+        .into_iter()
+        .filter(|&(_, d)| d <= depth)
+        .map(|(l, d)| json!({ "lock": idx.locks[l as usize], "dist": d, "path": idx.witness(m, l).map(|p| path_json(idx, &p)) }))
+        .collect();
+    json!({ "method": r.key, "file": idx.files[r.file as usize], "line": line, "held": held, "may_held": may })
+}
+
+/// The same answer as [`query`], as JSON.
+pub fn query_json(idx: &Index, q: &Query, depth: u8) -> Value {
+    match q {
+        Query::At { file, line } => Value::Array(idx.locate(file, *line).into_iter().map(|m| point_json(idx, m, *line, depth)).collect()),
+        Query::Method(needle) => Value::Array(
+            idx.find_methods(needle).into_iter().map(|m| point_json(idx, m, idx.methods[m as usize].line_lo, depth)).collect(),
+        ),
+        Query::Lock(needle) => Value::Array(
+            idx.find_locks(needle)
+                .into_iter()
+                .map(|l| {
+                    json!({
+                        "lock": idx.locks[l as usize],
+                        "sites": idx.sites(l).into_iter().map(|(m, line)| json!({ "method": idx.methods[m as usize].key, "file": idx.files[idx.methods[m as usize].file as usize], "line": line })).collect::<Vec<_>>(),
+                        "holders": idx.holders(l).into_iter().filter(|&(_, d)| d <= depth).map(|(m, d)| json!({ "method": idx.methods[m as usize].key, "dist": d })).collect::<Vec<_>>(),
+                        "held_while_acquiring": idx.order_out(l).into_iter().map(|e| edge_json(idx, e)).collect::<Vec<_>>(),
+                        "acquired_while_holding": idx.order_in(l).into_iter().map(|e| edge_json(idx, e)).collect::<Vec<_>>(),
+                    })
+                })
+                .collect(),
+        ),
+        Query::Cycles => json!({
+            "inversions": idx.inversions().into_iter().map(|(a, b, g)| json!({ "a": edge_json(idx, a), "b": edge_json(idx, b), "gate": g.map(|g| idx.locks[g as usize].clone()) })).collect::<Vec<_>>(),
+            "groups": idx.cycles().into_iter().map(|c| c.into_iter().map(|l| idx.locks[l as usize].clone()).collect::<Vec<_>>()).collect::<Vec<_>>(),
+        }),
+        Query::Binder => Value::Array(
+            idx.binder_sites(depth)
+                .into_iter()
+                .map(|(k, t, l, d)| {
+                    let c = &idx.calls[k as usize];
+                    json!({
+                        "caller": method_json(idx, c.caller), "line": c.line, "callee": idx.methods[t as usize].key,
+                        "lock": idx.locks[l as usize], "dist": d,
+                        "path": if d > 0 { idx.witness(c.caller, l).map(|p| path_json(idx, &p)) } else { None }
+                    })
+                })
+                .collect(),
+        ),
+    }
 }
