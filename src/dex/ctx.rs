@@ -54,7 +54,8 @@ use std::io::{Read, Write};
 const NO_LINE: u32 = 0;
 /// A span whose release was not observed is held to the end of the method.
 const TO_END: u32 = u32::MAX;
-const MAGIC: &[u8; 8] = b"DXLKCTX1";
+const MAGIC: &[u8; 8] = b"DXLKCTX2";
+const ACC_ABSTRACT: u32 = 0x400;
 
 /// A lock acquisition and the source-line range it is held over.
 #[derive(Clone, Debug)]
@@ -87,6 +88,9 @@ pub struct MethodRec {
     pub spans: Vec<Span>,
     /// Range into [`Index::calls`] of this method's call sites.
     pub calls: (u32, u32),
+    /// A remote binder entry: an abstract method of an AIDL interface, a
+    /// `$Stub$Proxy` method, or `IBinder.transact` — calling it blocks on IPC.
+    pub binder: bool,
 }
 
 /// `to` is acquired while `from` is held; `method`/`line` is one such site and
@@ -174,6 +178,19 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
     let n = methods.len();
     let id_of: HashMap<String, u32> =
         methods.iter().enumerate().map(|(i, m)| (m.key(), i as u32)).collect();
+    let ifaces = super::binder::binder_interfaces(dex);
+    // Remote binder entries. A concrete service that happens to implement a $Stub
+    // is not one: only abstract AIDL methods (reached by interface dispatch), the
+    // generated client proxy, and the raw transact block on IPC.
+    let is_binder = |m: &Method| -> bool {
+        if m.class == "android.os.IBinder" && m.name.starts_with("transact") {
+            return true;
+        }
+        if m.name.starts_with('<') || m.name == "asBinder" || m.name == "getInterfaceDescriptor" {
+            return false;
+        }
+        m.class.ends_with("$Stub$Proxy") || (m.access & ACC_ABSTRACT != 0 && ifaces.contains(&m.class))
+    };
 
     // Canonical lock per acquisition site, shared with resolution: (method, line)
     // -> name, or None when two different acquisitions share a line.
@@ -285,7 +302,15 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             let held = held.iter().map(|h| intern(h, &mut locks, &mut lock_id)).collect();
             raw_calls.push(RawCall { caller: i as u32, class, sig: format!("{name}:{sig}"), kind, line, held });
         }
-        recs.push(MethodRec { key: m.key(), file, line_lo, line_hi, spans, calls: (c0, raw_calls.len() as u32) });
+        recs.push(MethodRec {
+            key: m.key(),
+            file,
+            line_lo,
+            line_hi,
+            spans,
+            calls: (c0, raw_calls.len() as u32),
+            binder: is_binder(m),
+        });
     }
     log::debug!("ctx: intern {:.2?} ({} locks)", t0.elapsed(), locks.len());
 
@@ -640,6 +665,44 @@ impl Index {
         cyc
     }
 
+    /// Pairs of locks acquired in both orders — the concrete deadlock candidates —
+    /// tightest first: by the larger of the two distances, then by more occurrences.
+    pub fn inversions(&self) -> Vec<(&OrderEdge, &OrderEdge)> {
+        let at: HashMap<(u32, u32), usize> =
+            self.order.iter().enumerate().map(|(i, e)| ((e.from, e.to), i)).collect();
+        let mut v: Vec<(&OrderEdge, &OrderEdge)> = self
+            .order
+            .iter()
+            .filter(|e| e.from < e.to)
+            .filter_map(|e| at.get(&(e.to, e.from)).map(|&j| (e, &self.order[j])))
+            .collect();
+        v.sort_by_key(|(a, b)| (a.dist.max(b.dist), std::cmp::Reverse(a.count.min(b.count)), a.from, a.to));
+        v
+    }
+
+    /// Calls into a remote binder entry made while a lock is held (intra, d = 0) or
+    /// may be held on entry to the calling method (d = frames to a holder), within
+    /// `depth`. Each item: (call index, target, lock, distance), nearest first.
+    pub fn binder_sites(&self, depth: u8) -> Vec<(u32, u32, u32, u8)> {
+        let mut v = Vec::new();
+        for (k, c) in self.calls.iter().enumerate() {
+            let Some(&t) = c.targets.iter().find(|&&t| self.methods[t as usize].binder) else { continue };
+            let mut seen: HashSet<u32> = HashSet::default();
+            for &l in &c.held {
+                if seen.insert(l) {
+                    v.push((k as u32, t, l, 0));
+                }
+            }
+            for (l, d) in self.may_held(c.caller) {
+                if d <= depth && seen.insert(l) {
+                    v.push((k as u32, t, l, d));
+                }
+            }
+        }
+        v.sort_by_key(|&(k, _, l, d)| (d, k, l));
+        v
+    }
+
     pub fn order_out(&self, lock: u32) -> Vec<&OrderEdge> {
         self.order.iter().filter(|e| e.from == lock).collect()
     }
@@ -715,6 +778,7 @@ impl Index {
             }
             o.u32(m.calls.0)?;
             o.u32(m.calls.1)?;
+            o.u8(m.binder as u8)?;
         }
         o.u32(self.calls.len() as u32)?;
         for c in &self.calls {
@@ -763,7 +827,8 @@ impl Index {
                 spans.push(Span { lock: i.u32()?, enter: i.u32()?, exit: i.u32()?, held: i.u32s()? });
             }
             let calls = (i.u32()?, i.u32()?);
-            methods.push(MethodRec { key, file, line_lo, line_hi, spans, calls });
+            let binder = i.u8()? != 0;
+            methods.push(MethodRec { key, file, line_lo, line_hi, spans, calls, binder });
         }
         let nc = i.u32()? as usize;
         let mut calls = Vec::with_capacity(nc);

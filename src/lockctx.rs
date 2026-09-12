@@ -58,6 +58,8 @@ pub enum Query {
     Lock(String),
     /// Lock-order cycles (deadlock candidates).
     Cycles,
+    /// Binder calls made while a lock is (or may be) held.
+    Binder,
 }
 
 /// Answer `q` against `idx`, writing a human-readable report to `w`. Locks held
@@ -99,32 +101,70 @@ pub fn query(idx: &Index, q: &Query, depth: u8, w: &mut impl Write) -> Result<()
             }
         }
         Query::Cycles => {
-            let cyc = idx.cycles();
-            writeln!(w, "{} lock-order cycle group(s)", cyc.len())?;
-            for (i, c) in cyc.iter().enumerate() {
-                writeln!(w, "\n[{}] {} locks:", i + 1, c.len())?;
-                for &l in c {
-                    writeln!(w, "  {}", idx.locks[l as usize])?;
+            let inv = idx.inversions();
+            writeln!(w, "{} lock pair(s) acquired in both orders (tightest first):", inv.len())?;
+            for (a, b) in inv.iter().take(50) {
+                writeln!(w, "\n  {}  <->  {}", idx.locks[a.from as usize], idx.locks[a.to as usize])?;
+                for e in [a, b] {
+                    writeln!(
+                        w,
+                        "    {} -> {}   ({}x, d={}, e.g. {} in {})",
+                        short(&idx.locks[e.from as usize]),
+                        short(&idx.locks[e.to as usize]),
+                        e.count,
+                        e.dist,
+                        loc(idx, e.method, e.line),
+                        idx.methods[e.method as usize].key
+                    )?;
                 }
-                // The edges inside the group, each with a witness site.
-                for e in &idx.order {
-                    if c.contains(&e.from) && c.contains(&e.to) {
-                        writeln!(
-                            w,
-                            "    {} -> {}   ({}x, d={}, e.g. {} {})",
-                            idx.locks[e.from as usize],
-                            idx.locks[e.to as usize],
-                            e.count,
-                            e.dist,
-                            idx.methods[e.method as usize].key,
-                            loc(idx, e.method, e.line)
-                        )?;
+            }
+            if inv.len() > 50 {
+                writeln!(w, "\n  ... {} more", inv.len() - 50)?;
+            }
+            let cyc = idx.cycles();
+            writeln!(w, "\n{} strongly connected group(s) in the lock-order graph:", cyc.len())?;
+            for (i, c) in cyc.iter().enumerate() {
+                let names: Vec<&str> = c.iter().take(6).map(|&l| short(&idx.locks[l as usize])).collect();
+                let more = if c.len() > 6 { format!(", +{} more", c.len() - 6) } else { String::new() };
+                writeln!(w, "  [{}] {} locks: {}{}", i + 1, c.len(), names.join(", "), more)?;
+            }
+        }
+        Query::Binder => {
+            let sites = idx.binder_sites(depth);
+            writeln!(w, "{} binder call(s) with a lock held within {depth} frame(s) (nearest first):", sites.len())?;
+            let mut last_d = u8::MAX;
+            for (k, t, l, d) in sites.iter().take(300) {
+                let c = &idx.calls[*k as usize];
+                if *d != last_d {
+                    writeln!(w, "\n-- d={d} --")?;
+                    last_d = *d;
+                }
+                writeln!(
+                    w,
+                    "  {}  {}  ->  {}   holding {}",
+                    loc(idx, c.caller, c.line),
+                    idx.methods[c.caller as usize].key,
+                    idx.methods[*t as usize].key,
+                    idx.locks[*l as usize]
+                )?;
+                if *d > 0 {
+                    if let Some(path) = idx.witness(c.caller, *l) {
+                        write_path(idx, &path, w)?;
                     }
                 }
+            }
+            if sites.len() > 300 {
+                writeln!(w, "\n  ... {} more; lower --depth to narrow", sites.len() - 300)?;
             }
         }
     }
     Ok(())
+}
+
+/// A lock name without its package, for dense listings.
+fn short(name: &str) -> &str {
+    let cut = name.rfind('.').map(|i| name[..i].rfind('.').map(|j| j + 1).unwrap_or(0)).unwrap_or(0);
+    &name[cut..]
 }
 
 fn loc(idx: &Index, m: u32, line: u32) -> String {

@@ -75,7 +75,7 @@ pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
 }
 
 /// Classes that transitively extend `android.os.IInterface` — the AIDL surface.
-fn binder_interfaces(dex: &Dex) -> HashSet<String> {
+pub(super) fn binder_interfaces(dex: &Dex) -> HashSet<String> {
     // parent edges: class -> its superclass and interfaces.
     let mut parents: HashMap<&str, Vec<&str>> = HashMap::default();
     for c in &dex.classes {

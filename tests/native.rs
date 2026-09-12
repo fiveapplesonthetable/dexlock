@@ -130,6 +130,30 @@ fn fixture_ctx_index() {
     assert_eq!(idx.cycles(), vec![vec![ma.min(mb), ma.max(mb)]]);
 }
 
+/// Binder-under-lock phrased over the lock-context index agrees with the dedicated
+/// pass on `binder.dex`: the two intra sites at distance 0 and the private helper
+/// at distance 1 (its lock is held by the caller), and nothing else.
+#[test]
+fn fixture_ctx_binder_sites() {
+    let bytes = include_bytes!("fixtures/binder.dex");
+    let d = dex::parse_dex_blob(bytes).expect("parse fixture");
+    let idx = dex::ctx::build(&d, &dex::ctx::Options::default());
+    let mut got: Vec<(String, String, u8)> = idx
+        .binder_sites(8)
+        .into_iter()
+        .map(|(k, _, l, dist)| (idx.methods[idx.calls[k as usize].caller as usize].key.clone(), idx.locks[l as usize].clone(), dist))
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            ("t.Binder$Holder.helperLocked:()V".to_string(), "t.Binder$Holder.mLock".to_string(), 1),
+            ("t.Binder$Holder.underLock:()V".to_string(), "t.Binder$Holder.mLock".to_string(), 0),
+            ("t.Binder$Holder.underSyncMethod:()V".to_string(), "t.Binder$Holder".to_string(), 0),
+        ]
+    );
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]

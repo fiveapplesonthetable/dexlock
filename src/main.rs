@@ -114,6 +114,10 @@ struct CtxQueryArgs {
     #[arg(long)]
     cycles: bool,
 
+    /// List binder calls made while a lock is or may be held.
+    #[arg(long)]
+    binder: bool,
+
     /// Omit locks held more than this many call frames away.
     #[arg(long, default_value_t = 4)]
     depth: u8,
@@ -288,8 +292,12 @@ fn run_ctx(args: CtxArgs) -> Result<()> {
                 lockctx::query(&idx, &CtxQuery::Cycles, a.depth, &mut out)?;
                 any = true;
             }
+            if a.binder {
+                lockctx::query(&idx, &CtxQuery::Binder, a.depth, &mut out)?;
+                any = true;
+            }
             if !any {
-                anyhow::bail!("give one of --at, --method, --lock, --cycles");
+                anyhow::bail!("give one of --at, --method, --lock, --cycles, --binder");
             }
             Ok(())
         }
