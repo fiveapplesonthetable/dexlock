@@ -158,7 +158,7 @@ fn fixture_ctx_binder_sites() {
 /// each helper call are exactly those of its enclosing block, across an early
 /// return, a catch handler, try/finally, a switch, a loop, a successful `tryLock`,
 /// a read-write lock view, a lock taken/released through helper methods, and lambdas
-/// run synchronously (`forEach`) versus posted to a sink.
+/// the callee invokes (directly or transitively), stores, or cannot be inspected.
 #[test]
 fn fixture_cfg_held() {
     let bytes = include_bytes!("fixtures/cfg.dex");
@@ -195,15 +195,18 @@ fn fixture_cfg_held() {
     assert_eq!(held_at("inHelperLock"), vec!["t.Cfg.mL".to_string()], "lock taken by a helper is held after it returns");
     assert_eq!(held_at("afterHelper"), Vec::<String>::new(), "lock released by a helper");
 
-    // A lambda run synchronously by `forEach` inherits the block's lock (a callback
-    // edge from the call site); one handed to a `post(...)` sink does not.
+    // A lambda inherits the block's lock iff the callee invokes it — directly or
+    // by passing it on. A stored one gets nothing; so does one handed to a callee
+    // outside the inputs (its body cannot be inspected: assumed not held).
     let ma = idx.find_locks("t.Cfg.mA")[0];
     let caller_of = |callee: &str| -> u32 {
         let t = idx.find_methods(&format!("t.Cfg.{callee}:()V"))[0];
         idx.calls.iter().find(|c| c.targets.contains(&t)).expect("called").caller
     };
-    assert!(idx.dist(caller_of("inLambda"), ma).is_some(), "forEach lambda runs under mA");
-    assert_eq!(idx.dist(caller_of("inPosted"), ma), None, "posted lambda does not");
+    assert!(idx.dist(caller_of("inLambda"), ma).is_some(), "callee invokes the lambda");
+    assert!(idx.dist(caller_of("inLambda2"), ma).is_some(), "callee passes it to one that invokes it");
+    assert_eq!(idx.dist(caller_of("inPosted"), ma), None, "stored lambda is not invoked");
+    assert_eq!(idx.dist(caller_of("inExternal"), ma), None, "callee outside the inputs: assumed not held");
 }
 
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends

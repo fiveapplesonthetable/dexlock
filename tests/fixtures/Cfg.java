@@ -3,7 +3,8 @@
 // Each helper call is made in a specific lock context; the test asserts the locks
 // held at each call site. Early return, a catch handler, try/finally, a switch, a
 // loop, a successful tryLock, a read-write lock view, a lock taken and released
-// through helper methods, and lambdas run synchronously vs. posted all appear.
+// through helper methods, and lambdas the callee invokes, stores, or is outside
+// the inputs all appear.
 // Rebuild: javac -d out Cfg.java && d8 --lib android.jar --min-api 21 --output out out/t/*.class && cp out/classes.dex cfg.dex
 package t;
 
@@ -85,13 +86,18 @@ class Cfg {
         afterRead();          // released
     }
 
-    interface Sink { void post(Runnable r); }
-    Sink mSink;
+    interface Action { void go(); }
+    Action mPending;
+    void each(Action a) { a.go(); }          // runs its callback synchronously
+    void viaEach(Action a) { each(a); }      // passes it on to one that does
+    void later(Action a) { mPending = a; }   // stores it: runs later, if ever
 
     void lambdas(java.util.List<String> list) {
         synchronized (mA) {
-            list.forEach(x -> inLambda());   // run synchronously by forEach: mA held
-            mSink.post(() -> inPosted());    // run later by the sink: no lock context
+            each(() -> inLambda());          // callee invokes it: mA held
+            viaEach(() -> inLambda2());      // transitively invoked: mA held
+            later(() -> inPosted());         // stored, not invoked: no lock context
+            list.forEach(x -> inExternal()); // callee outside the inputs: assumed not held
         }
     }
 
@@ -108,5 +114,6 @@ class Cfg {
     void after() {} void outside() {} void risky() {} void inCatch() {} void inFinally() {}
     void s1() {} void s2() {} void s3() {} void body() {} void tail() {}
     void inTry() {} void post() {} void inRead() {} void afterRead() {}
-    void inHelperLock() {} void afterHelper() {} void inLambda() {} void inPosted() {}
+    void inHelperLock() {} void afterHelper() {}
+    void inLambda() {} void inLambda2() {} void inPosted() {} void inExternal() {}
 }

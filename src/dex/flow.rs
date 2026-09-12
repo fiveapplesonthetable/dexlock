@@ -83,10 +83,17 @@ pub(super) enum Event<'a> {
     /// A lock was released (monitor-exit / `unlock`) at `line`; `enter` is the line
     /// of the acquisition it balances (`None` for a lock held on entry).
     Release { lock: &'a Lock, line: Option<u32>, enter: Option<u32> },
-    /// A non-lock call, with every lock held at that point (grounded), and the
-    /// concrete or declared class of each argument register where known (receiver
-    /// first) — from `new-instance`, `this`, or a field's declared type.
-    Call { inv: &'a Invoke, held: &'a [Lock], line: Option<u32>, arg_types: &'a [Option<String>] },
+    /// A non-lock call, with every lock held at that point (grounded); per argument
+    /// register (receiver first): the object's concrete or declared class where
+    /// known (`new-instance`, `this`, a field's declared type), and which formal
+    /// parameter of the calling method it is, if it is one (receiver = 0).
+    Call {
+        inv: &'a Invoke,
+        held: &'a [Lock],
+        line: Option<u32>,
+        arg_types: &'a [Option<String>],
+        arg_formals: &'a [Option<u32>],
+    },
 }
 
 /// The lock-relevant effect of one instruction, from the linear register pass.
@@ -181,6 +188,11 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
         for j in 1..m.ins {
             regs.insert(t + j, Lock::new(Root::Param(j)));
         }
+    } else if m.ins > 0 {
+        let base = m.registers.saturating_sub(m.ins);
+        for j in 0..m.ins {
+            regs.insert(base + j, Lock::new(Root::Param(j)));
+        }
     }
     // The class of the object in a register where the bytecode says: `this`, a
     // `new-instance`, or an object field's declared type.
@@ -191,9 +203,11 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
     let mut last_ret: Option<Lock> = None;
     let mut ops: Vec<LockOp> = Vec::with_capacity(n);
     let mut call_types: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
+    let mut call_formals: Vec<Vec<Option<u32>>> = Vec::with_capacity(n);
     for insn in &m.insns {
         let mut op = LockOp::None;
         let mut arg_types = Vec::new();
+        let mut arg_formals = Vec::new();
         match &insn.op {
             Op::Iget { dst, class, field, ty, .. } => {
                 regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
@@ -255,6 +269,15 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
                     None => {
                         op = LockOp::Call;
                         arg_types = inv.args.iter().map(|r| types.get(r).cloned()).collect();
+                        arg_formals = inv
+                            .args
+                            .iter()
+                            .map(|r| match regs.get(r).map(|l| (&l.root, l.fields.is_empty())) {
+                                Some((Root::This, true)) => Some(0),
+                                Some((Root::Param(i), true)) => Some(*i),
+                                _ => None,
+                            })
+                            .collect();
                     }
                 }
             }
@@ -262,6 +285,7 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
         }
         ops.push(op);
         call_types.push(arg_types);
+        call_formals.push(arg_formals);
     }
 
     // 2. Basic blocks over the instruction list.
@@ -339,7 +363,8 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
     // 3. Forward dataflow of the held stack, intersection join.
     let transfer = |st: &mut State, b: usize, mut emit: Option<&mut F>| {
         let (bs, be) = blocks[b];
-        for ((insn, op), arg_types) in m.insns[bs..be].iter().zip(&ops[bs..be]).zip(&call_types[bs..be]) {
+        let rows = m.insns[bs..be].iter().zip(&ops[bs..be]).zip(&call_types[bs..be]).zip(&call_formals[bs..be]);
+        for (((insn, op), arg_types), arg_formals) in rows {
             let line = m.line_at(insn.offset);
             match op {
                 LockOp::Enter(l) | LockOp::Acquire(l) => {
@@ -369,7 +394,7 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
                 LockOp::Call => {
                     let Op::Invoke(inv) = &insn.op else { continue };
                     if let Some(f) = emit.as_deref_mut() {
-                        f(Event::Call { inv, held: &st.locks, line, arg_types });
+                        f(Event::Call { inv, held: &st.locks, line, arg_types, arg_formals });
                     }
                     // A helper's net effect: it may release for us, or return holding.
                     if let Some(eff) = effects.get(&inv.key()) {

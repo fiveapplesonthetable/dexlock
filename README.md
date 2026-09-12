@@ -369,11 +369,17 @@ dispatch with a small implementation set (`--cha-cap`, default 16), to each
 override; a broad interface such as `Runnable.run` is left unlinked on purpose,
 since "every lock any caller holds" is noise. When the receiver's concrete class is
 known from the bytecode (`new`, `this`, a field's declared type) the call is
-devirtualized to that one method instead. A lambda or anonymous class passed to a
-call that runs it synchronously (`forEach`, `computeIfAbsent`, …) is linked as a
-callee, so a callback body inherits the block's locks; one handed to a `post`,
-`execute`, `submit`, `schedule`, `add`/`register`/`set`… sink is not, since it runs
-later without them. On `services.jar` + `framework.jar`: 1.56M call sites, 1.08M
+devirtualized to that one method instead. Calls on a *parameter* are resolved by
+parameter type-flow: for every formal that is invoked on (directly, or after being
+passed on), the classes callers actually pass in are collected — a lambda, an
+anonymous class, a `new`, a field's declared type — and the invoke inside the callee
+links to exactly those classes' methods. So `each(a) { a.go(); }` called with a lambda
+links that lambda, and the lambda body inherits the locks held at the call; a callee
+that only *stores* its argument (`Handler.post`, a listener registry) invokes nothing
+and links nothing. There is no list of "async" method names: what runs a callback
+is read from the code. A callee outside the inputs (`java.util.List.forEach`)
+cannot be inspected, so the lock is assumed **not** held through it — an
+under-approximation, never an invention; include the jar to close that gap. On `services.jar` + `framework.jar`: 1.56M call sites, 1.08M
 linked (12.6k devirtualized, 69k callback edges), 472k into classes outside the
 inputs, 0.4% unlinked by wide dispatch. Lock names are the canonical
 identities from resolution, so a lock reached through an alias — `mGlobalLockWithoutBoost`
@@ -386,11 +392,11 @@ by distance, `mProcLock` has ~2.7k methods within 4 frames and the order graph i
 6.7k edges. The lock-order graph relates an acquisition only to locks held within
 `--order-depth` frames (default 3).
 
-Limits: a callback reached only through a wide interface, or through reflection, is
-not linked, so lock context does not flow into it; whether an external API runs a
-callback synchronously is decided by the sink-name list above; a *may* set is a
-superset, and every witness path is real but not necessarily the only or the
-common one.
+Limits: a callback reached only through a wide interface on a non-parameter
+receiver, or through reflection, is not linked, so lock context does not flow into
+it; a callback run by code outside the inputs is treated as not under the lock; a
+*may* set is a superset, and every witness path is real but not necessarily the
+only or the common one.
 
 ### The DEX front-end
 

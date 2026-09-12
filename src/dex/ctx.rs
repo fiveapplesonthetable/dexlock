@@ -166,36 +166,29 @@ struct RawCall {
     held: Vec<u32>,
     /// The receiver's known class when it is more specific than the static type.
     recv_ty: Option<String>,
-    /// Lambda / anonymous classes passed as arguments — callbacks the callee may run.
-    callbacks: Vec<String>,
+    /// Arguments whose class is known, by position — objects the callee may invoke.
+    typed_args: Vec<(u32, String)>,
+    /// Which formal of the calling method each argument is, if it is one.
+    arg_formals: Vec<Option<u32>>,
 }
 
-/// A call as recorded by the walk: (class, name, sig, kind, line, held, recv_ty, callbacks).
-type WalkCall = (String, String, String, InvokeKind, u32, Vec<String>, Option<String>, Vec<String>);
+/// A call as recorded by the walk.
+struct WalkCall {
+    class: String,
+    name: String,
+    sig: String,
+    kind: InvokeKind,
+    line: u32,
+    held: Vec<String>,
+    recv_ty: Option<String>,
+    typed_args: Vec<(u32, String)>,
+    arg_formals: Vec<Option<u32>>,
+}
 
 /// Per-method output of the parallel walk, before global interning.
 struct Scanned {
     spans: Vec<(String, u32, u32, Vec<String>)>,
     calls: Vec<WalkCall>,
-}
-
-/// A d8-desugared lambda (`Outer$$ExternalSyntheticLambdaN`) or an anonymous inner
-/// class (`Outer$N`): an object whose only purpose is to be called back.
-fn is_callback_class(c: &str) -> bool {
-    if c.contains("$$ExternalSyntheticLambda") {
-        return true;
-    }
-    c.rsplit('$').next().is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
-}
-
-/// Calls that take a callback to run *later* (or to register it), so a lock held
-/// at the call is not held when the callback runs: no edge into it.
-fn is_async_sink(name: &str) -> bool {
-    const ASYNC: [&str; 17] = [
-        "post", "send", "execute", "submit", "schedule", "start", "add", "register", "set", "put",
-        "offer", "enqueue", "queue", "observe", "subscribe", "listen", "<",
-    ];
-    ASYNC.iter().any(|p| name.starts_with(p))
 }
 
 pub fn build(dex: &Dex, opts: &Options) -> Index {
@@ -282,13 +275,23 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                         sp.0 = Some(sp.0.map_or(x, |e| e.max(x)));
                     }
                 }
-                Event::Call { inv, held, line, arg_types } => {
+                Event::Call { inv, held, line, arg_types, arg_formals } => {
                     let line = line.unwrap_or(NO_LINE);
                     let held = named(held, line, &mut name_of);
                     let recv_ty = if inv.kind == InvokeKind::Static { None } else { arg_types.first().cloned().flatten() };
-                    let callbacks: Vec<String> =
-                        arg_types.iter().flatten().filter(|c| is_callback_class(c)).cloned().collect();
-                    calls.push((inv.class.clone(), inv.name.clone(), inv.sig.clone(), inv.kind, line, held, recv_ty, callbacks));
+                    let typed_args: Vec<(u32, String)> =
+                        arg_types.iter().enumerate().filter_map(|(i, t)| t.as_ref().map(|c| (i as u32, c.clone()))).collect();
+                    calls.push(WalkCall {
+                        class: inv.class.clone(),
+                        name: inv.name.clone(),
+                        sig: inv.sig.clone(),
+                        kind: inv.kind,
+                        line,
+                        held,
+                        recv_ty,
+                        typed_args,
+                        arg_formals: arg_formals.to_vec(),
+                    });
                 }
             });
             let spans = order
@@ -345,7 +348,7 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             })
             .collect();
         let c0 = raw_calls.len() as u32;
-        for (class, name, sig, kind, line, held, recv_ty, callbacks) in s.calls {
+        for WalkCall { class, name, sig, kind, line, held, recv_ty, typed_args, arg_formals } in s.calls {
             let held = held.iter().map(|h| intern(h, &mut locks, &mut lock_id)).collect();
             raw_calls.push(RawCall {
                 caller: i as u32,
@@ -355,7 +358,8 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                 line,
                 held,
                 recv_ty,
-                callbacks,
+                typed_args,
+                arg_formals,
             });
         }
         recs.push(MethodRec {
@@ -417,18 +421,16 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             anc.iter().find_map(|a| id_of.get(&format!("{a}.{sigk}")).copied())
         })
     };
-    // Instance methods per class, for callback edges into lambda / anonymous classes.
-    let mut methods_of: HashMap<&str, Vec<u32>> = HashMap::default();
-    for (i, m) in methods.iter().enumerate() {
-        if !m.name.starts_with('<') && !m.is_static() {
-            methods_of.entry(m.class.as_str()).or_default().push(i as u32);
-        }
-    }
-
     let class_set: HashSet<&str> = dex.classes.iter().map(|c| c.descriptor.as_str()).collect();
-    let (mut external, mut unlinked, mut devirt, mut callback_edges) = (0usize, 0usize, 0usize, 0usize);
+    let (mut external, mut unlinked, mut devirt) = (0usize, 0usize, 0usize);
     let mut calls: Vec<Call> = Vec::with_capacity(raw_calls.len());
-    for RawCall { caller, class, sig: sigk, kind, line, held, recv_ty, callbacks } in raw_calls {
+    // Per call: the callbacks passed (by position) and which caller formals the
+    // arguments are — the inputs to callback linking below.
+    let mut call_args: Vec<Vec<(u32, String)>> = Vec::with_capacity(raw_calls.len());
+    let mut call_formals: Vec<Vec<Option<u32>>> = Vec::with_capacity(raw_calls.len());
+    // (name:sig, receiver-is-formal) per call, for the parameter type-flow below.
+    let mut call_recv: Vec<Option<(String, u32)>> = Vec::with_capacity(raw_calls.len());
+    for RawCall { caller, class, sig: sigk, kind, line, held, recv_ty, typed_args, arg_formals } in raw_calls {
         // A receiver whose concrete class is known dispatches to exactly one method.
         let precise = recv_ty
             .as_deref()
@@ -441,7 +443,11 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             }
             None => resolve_from(&mut anc_memo, &mut static_memo, &class, &sigk).into_iter().collect(),
         };
-        if precise.is_none() && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
+        // Overrides are linked by class hierarchy only when the receiver is neither of
+        // known class nor a formal: a formal's targets come exactly from what callers
+        // pass (below), which fan-out would only blur.
+        let on_formal = arg_formals.first().is_some_and(|f| f.is_some());
+        if precise.is_none() && !on_formal && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
             if let Some(ds) = decl.get(&sigk) {
                 if ds.len() <= opts.cha_cap {
                     for &d in ds {
@@ -461,27 +467,101 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                 }
             }
         }
-        let none = targets.is_empty();
-        // A callback passed to a call that runs it synchronously (`forEach`,
-        // `computeIfAbsent`, ...) runs under the caller's locks: link its methods.
-        let name = sigk.split(':').next().unwrap_or("");
-        if !callbacks.is_empty() && !is_async_sink(name) {
-            for cb in &callbacks {
-                for &t in methods_of.get(cb.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
-                    if !targets.contains(&t) {
-                        targets.push(t);
-                        callback_edges += 1;
-                    }
+        if targets.is_empty() {
+            if class_set.contains(class.as_str()) { unlinked += 1 } else { external += 1 }
+        }
+        calls.push(Call { caller, line, held, targets });
+        let recv_formal = if matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
+            arg_formals.first().copied().flatten().map(|j| (sigk.clone(), j))
+        } else {
+            None
+        };
+        call_recv.push(recv_formal);
+        call_args.push(typed_args);
+        call_formals.push(arg_formals);
+    }
+
+    // Parameter type-flow, derived rather than guessed. For every formal that is
+    // invoked on — as the receiver of a virtual/interface call in its method, or
+    // passed on to such a formal — collect the concrete classes callers pass in
+    // (an argument of known class, or a formal of their own, transitively), and
+    // resolve the call inside the callee to exactly those classes' methods. The
+    // edge sits where the invoke is, so distances stay exact. A callee that stores
+    // the object (Handler.post, a listener registry) invokes nothing, so it links
+    // nothing; a callee outside the inputs cannot be inspected, so the lock is
+    // assumed *not* held through it — an under-approximation, never an invention.
+    // demand[m]: formals of m that are invoked on (directly or by being passed on).
+    let mut demand: Vec<HashSet<u32>> = vec![HashSet::default(); n];
+    for (k, c) in calls.iter().enumerate() {
+        if let Some((_, j)) = &call_recv[k] {
+            demand[c.caller as usize].insert(*j);
+        }
+    }
+    // passes: (caller, caller formal i, target, position p) — i flows into t's p.
+    let mut passes: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for (k, c) in calls.iter().enumerate() {
+        for (p, f) in call_formals[k].iter().enumerate() {
+            if let Some(i) = f {
+                for &t in &c.targets {
+                    passes.push((c.caller, *i, t, p as u32));
                 }
             }
         }
-        calls.push(Call { caller, line, held, targets });
-        if none {
-            if class_set.contains(class.as_str()) { unlinked += 1 } else { external += 1 }
+    }
+    loop {
+        let mut changed = false;
+        for &(caller, i, t, p) in &passes {
+            if demand[t as usize].contains(&p) && demand[caller as usize].insert(i) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    // reach[(m, j)]: classes that may reach demanded formal j of m.
+    let mut reach: HashMap<(u32, u32), HashSet<String>> = HashMap::default();
+    for (k, c) in calls.iter().enumerate() {
+        for (p, class) in &call_args[k] {
+            for &t in &c.targets {
+                if demand[t as usize].contains(p) {
+                    reach.entry((t, *p)).or_default().insert(class.clone());
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &(caller, i, t, p) in &passes {
+            if !demand[t as usize].contains(&p) {
+                continue;
+            }
+            let Some(src) = reach.get(&(caller, i)).cloned() else { continue };
+            let dst = reach.entry((t, p)).or_default();
+            let before = dst.len();
+            dst.extend(src);
+            if dst.len() != before {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut callback_edges = 0usize;
+    for k in 0..calls.len() {
+        let Some((sigk, j)) = &call_recv[k] else { continue };
+        let Some(classes) = reach.get(&(calls[k].caller, *j)) else { continue };
+        let add: Vec<u32> = classes.iter().filter_map(|c| resolve_from(&mut anc_memo, &mut static_memo, c, sigk)).collect();
+        for t in add {
+            if !calls[k].targets.contains(&t) {
+                calls[k].targets.push(t);
+                callback_edges += 1;
+            }
         }
     }
     log::info!(
-        "ctx: {} call sites: {} linked ({devirt} devirtualized by receiver type, {callback_edges} callback edges), {} into classes outside the inputs, {} unlinked (wide dispatch or missing declaration)",
+        "ctx: {} call sites: {} linked ({devirt} devirtualized by receiver type, {callback_edges} resolved by parameter type-flow), {} into classes outside the inputs, {} unlinked (wide dispatch or missing declaration)",
         calls.len(),
         calls.len() - external - unlinked,
         external,
