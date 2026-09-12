@@ -261,6 +261,44 @@ fn native_apex_matches_deapexer() {
     eprintln!("native apex reader verified on {checked} jars");
 }
 
+/// The inconsistent-locking pass over `fixtures/race.dex`. Exactly one field is
+/// reported: `mGuarded`, held under `mLock` at five of six accesses and written with
+/// no lock in `run()` — on a `Runnable`, so the write is marked concurrent. The
+/// field the pass exists not to misreport is `mCallerLocked`: its only write is in a
+/// private helper whose every caller holds `mLock`, so the lock is one frame up.
+/// Counted as unguarded it would clear both thresholds and be reported, as the
+/// withdrawn first version of this pass did for `PowerManagerService.mDirty`.
+#[test]
+fn fixture_race_inconsistent_locking() {
+    let bytes = include_bytes!("fixtures/race.dex");
+    let d = dex::parse_dex_blob(bytes).expect("parse fixture");
+    let f = dex::race::races(&d, &dex::race::Options::default());
+
+    let fields: Vec<&str> = f.iter().map(|x| x.field.as_str()).collect();
+    assert_eq!(fields, ["t.Race.mGuarded"], "only the inconsistently locked field is reported");
+
+    let one = &f[0];
+    assert_eq!(one.guard, "t.Race.mLock");
+    assert_eq!((one.guarded, one.total), (5, 6));
+    assert!(one.guarded_at.iter().all(|a| a.held == ["t.Race.mLock"]));
+
+    assert_eq!(one.unguarded.len(), 1);
+    let u = &one.unguarded[0];
+    assert_eq!(u.method, "t.Race.run:()V");
+    assert_eq!(u.file.as_deref(), Some("Race.java"));
+    assert!(u.write && u.held.is_empty());
+    assert!(u.concurrent, "run() on a Runnable is a concurrent entry point");
+
+    // The helper's write is seen as guarded by the lock its callers hold, which is
+    // why mCallerLocked has no unguarded access to report.
+    let held_in_helper: Vec<&dex::race::Access> = f
+        .iter()
+        .flat_map(|x| x.guarded_at.iter().chain(&x.unguarded))
+        .filter(|a| a.method.contains("helperLocked"))
+        .collect();
+    assert!(held_in_helper.iter().all(|a| a.held == ["t.Race.mLock"]));
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]

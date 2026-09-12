@@ -8,6 +8,7 @@
 //!   * `binder` — flag binder calls made while a lock is held.
 //!   * `ctx` — build and query the lock-context index (locks that may be held at a
 //!     line or method, the call path that brings each, and lock ordering).
+//!   * `race` — fields guarded by a lock nearly everywhere and written with none.
 //!
 //! `-j/--threads` bounds the worker pool for any subcommand (default: all cores).
 
@@ -44,6 +45,40 @@ enum Cmd {
     /// Lock-context index: which locks may be held at a line/method, via what
     /// call path, and how locks order against each other.
     Ctx(CtxArgs),
+    /// Flag fields guarded by a lock nearly everywhere and written with none.
+    Race(RaceArgs),
+}
+
+#[derive(Parser, Debug)]
+struct RaceArgs {
+    /// Jars / apks / apex / `.dex` files / directories to analyze (merged).
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Narrow a directory input to jars whose name contains this substring.
+    #[arg(long)]
+    scope: Option<String>,
+
+    /// Output path (JSON array).
+    #[arg(long, short = 'o', default_value = "dexlock_races.json")]
+    output: PathBuf,
+
+    /// A lock is the field's guard only if held at this many of its accesses.
+    #[arg(long, default_value_t = 3)]
+    min_guarded: usize,
+
+    /// ...and at this fraction of them.
+    #[arg(long, default_value_t = 0.8)]
+    min_ratio: f64,
+
+    /// Furthest (in call frames) a held lock propagates when deciding that a write
+    /// holds no lock on any path.
+    #[arg(long, default_value_t = 8)]
+    max_depth: u8,
+
+    /// Use the `dexdump` back-end instead of the native reader.
+    #[arg(long)]
+    dexdump: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -251,7 +286,23 @@ fn main() -> Result<()> {
         Cmd::Dump(a) => run_dump(a),
         Cmd::Binder(a) => run_binder(a),
         Cmd::Ctx(a) => run_ctx(a),
+        Cmd::Race(a) => run_race(a),
     }
+}
+
+fn run_race(args: RaceArgs) -> Result<()> {
+    if let Some(d) = &args.dexdump {
+        std::env::set_var("DEXLOCK_DEXDUMP", d);
+        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
+    }
+    let opts = dexlock::dex::race::Options {
+        min_guarded: args.min_guarded,
+        min_ratio: args.min_ratio,
+        ctx: dexlock::dex::ctx::Options { max_depth: args.max_depth, ..Default::default() },
+    };
+    let n = dump::run_race(&args.inputs, args.scope.as_deref(), &opts, &args.output)?;
+    println!("Wrote {n} inconsistently locked fields to {}", args.output.display());
+    Ok(())
 }
 
 fn run_ctx(args: CtxArgs) -> Result<()> {

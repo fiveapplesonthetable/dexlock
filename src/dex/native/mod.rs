@@ -441,9 +441,13 @@ impl<'a> Section<'a> {
                 let (class, field, _) = self.field(u[i + 1] as u32)?;
                 Op::Sget { dst: aa, class, field }
             }
+            0x67..=0x6d => {
+                let (class, field, _) = self.field(u[i + 1] as u32)?;
+                Op::Sput { src: aa, class, field }
+            }
             0x6e..=0x72 => self.invoke(op, u, i, false)?,
             0x74..=0x78 => self.invoke(op, u, i, true)?,
-            // Everything else (const*, sput*, arith, aget/aput, goto, if-*, ...) is
+            // Everything else (const*, arith, aget/aput, ...) is
             // `Other`, exactly as the textual path treats it (the resolve path ignores
             // goto/branch/throw/monitor-exit and never clears a register on Other).
             _ => Op::Other,

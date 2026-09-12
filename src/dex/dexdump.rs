@@ -299,6 +299,16 @@ fn parse_insn(body: &str) -> Op {
                 _ => Op::Other,
             }
         }
+        _ if mnem.starts_with("sput") => {
+            // "v0, Lcls;.field:type"
+            let mut it = rest.splitn(2, ',');
+            let src = it.next().and_then(reg);
+            let fref = it.next().map(str::trim).and_then(parse_field_ref);
+            match (src, fref) {
+                (Some(src), Some((class, field))) => Op::Sput { src, class, field },
+                _ => Op::Other,
+            }
+        }
         _ if mnem.starts_with("sget") => {
             // "v0, Lcls;.field:type"
             let mut it = rest.splitn(2, ',');

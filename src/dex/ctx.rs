@@ -275,6 +275,8 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                         sp.0 = Some(sp.0.map_or(x, |e| e.max(x)));
                     }
                 }
+                // Field accesses are the race pass's business, not the index's.
+                Event::Field { .. } => {}
                 Event::Call { inv, held, line, arg_types, arg_formals } => {
                     let line = line.unwrap_or(NO_LINE);
                     let held = named(held, line, &mut name_of);

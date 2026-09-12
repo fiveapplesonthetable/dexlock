@@ -24,7 +24,8 @@
 //! each site by its canonical lock. The `flow` module is the shared held-lock
 //! dataflow; `binder` flags binder calls made while a lock is held; `ctx` builds the
 //! queryable lock-context index (locks that may be held at any point, witness paths,
-//! and the lock-order graph with its inversions). Race analysis is out of scope.
+//! and the lock-order graph with its inversions); `race` reports fields whose
+//! locking discipline is inconsistent.
 
 use crate::dex::model::*;
 use rayon::prelude::*;
@@ -41,6 +42,7 @@ mod juc;
 mod native;
 pub mod input;
 pub mod model;
+pub mod race;
 pub mod resolve;
 
 /// Decode one DEX section blob into the [`model::Dex`] shape. Uses the native

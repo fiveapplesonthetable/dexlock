@@ -35,6 +35,8 @@ pub enum Op {
     MonitorExit(Reg),
     /// `sget-object dst, Lcls;.field:type`
     Sget { dst: Reg, class: String, field: String },
+    /// `sput-object src, Lcls;.field:type`
+    Sput { src: Reg, class: String, field: String },
     /// `iget-object dst, base, Lcls;.field:type`
     Iget {
         dst: Reg,

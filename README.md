@@ -202,7 +202,7 @@ implementations and the resolver, cache, and lookup are unchanged.
 
 ## CLI
 
-Four subcommands. `-j/--threads` bounds the worker pool for any of them (default: all cores).
+Five subcommands. `-j/--threads` bounds the worker pool for any of them (default: all cores).
 
 ### `resolve` — answer a contention CSV
 
@@ -414,6 +414,55 @@ receiver, or through reflection, is not linked, so lock context does not flow in
 it; a callback run by code outside the inputs is treated as not under the lock; a
 *may* set is a superset, and every witness path is real but not necessarily the
 only or the common one.
+
+### `race` — fields guarded almost everywhere, and written with no lock
+
+`@GuardedBy` is source-retained, so it is not in the DEX; this pass reads no
+annotation and guesses no guard from a name. It reports a field as
+**inconsistently locked** when three things are true of the call graph:
+
+1. **Lock `L` is held at these accesses** — a *must* set: taken in the accessing
+   method, or held on entry to a private helper by every one of its callers.
+2. **This write holds nothing, on any path** — a *may* set: no caller within
+   `--max-depth` frames holds a lock at any call site leading here, and the method
+   takes none itself before the write.
+3. **The write is reachable from a thread that runs concurrently** — a method
+   serving an AIDL interface (a binder thread), a `Runnable`/`Thread` `run`, or a
+   `Handler.handleMessage` — over the same call graph, reported per access.
+
+```sh
+dexlock race system/framework system/apex -o races.json
+# --min-guarded N (default 3) and --min-ratio R (default 0.8): a lock is the field's
+# guard only when held at that many of its accesses, and that fraction of them
+```
+
+Point 2 is the whole difference from the first version of this pass, which was
+withdrawn. That one called an access unguarded when it merely could not *see* a
+lock, so every caller-locked `…Locked` helper was a false positive —
+`PowerManagerService.mDirty` is `@GuardedBy("mLock")` and was reported. Such a
+helper now has its caller's lock in its may set and is not reported; on
+`services.jar` + `framework.jar` the count went from 1,226 fields to 79 across the
+whole system, 20 of them with a concurrent unguarded write.
+
+Excluded by definition rather than by guess: `final` and `volatile` fields, fields
+never written, and writes in `<init>`/`<clinit>` — a constructor runs before
+publication and a static initializer is serialized by the runtime.
+
+Each finding carries the guard, the counts (`5/6 accesses`), witness accesses for
+the discipline, and every unguarded write with its `File.java:line`:
+
+```json
+{"field":"…ProxyController.mOldRadioAccessFamily","guard":"…ProxyController.mSetRadioAccessFamilyStatus",
+ "guarded":7,"total":8,
+ "unguarded":[{"method":"…onMultiSimConfigChanged:()V","file":"ProxyController.java","line":330,
+               "write":true,"held":[],"concurrent":true}]}
+```
+
+What the pass does **not** claim is that a finding is a bug. An inconsistently
+locked field may be benign (`HalDeviceManager.mDbg`, a debug flag read under
+`mLock` and written lock-free by `enableVerboseLogging`), racy but tolerated, or
+safely published by other means. It reports the inconsistency and the evidence for
+both halves; the reader decides.
 
 ### The DEX front-end
 

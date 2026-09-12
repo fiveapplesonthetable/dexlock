@@ -83,6 +83,8 @@ pub(super) enum Event<'a> {
     /// A lock was released (monitor-exit / `unlock`) at `line`; `enter` is the line
     /// of the acquisition it balances (`None` for a lock held on entry).
     Release { lock: &'a Lock, line: Option<u32>, enter: Option<u32> },
+    /// An instance- or static-field access, with the locks held at that point.
+    Field { class: &'a str, field: &'a str, write: bool, held: &'a [Lock], line: Option<u32> },
     /// A non-lock call, with every lock held at that point (grounded); per argument
     /// register (receiver first): the object's concrete or declared class where
     /// known (`new-instance`, `this`, a field's declared type), and which formal
@@ -103,6 +105,8 @@ enum LockOp {
     Acquire(Lock),
     Release(Option<Lock>),
     Call,
+    /// A field access — never also a lock operation, so it rides in the same slot.
+    Field { class: String, field: String, write: bool },
     None,
 }
 
@@ -211,6 +215,7 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
         match &insn.op {
             Op::Iget { dst, class, field, ty, .. } => {
                 regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
+                op = LockOp::Field { class: class.clone(), field: field.clone(), write: false };
                 match ty.as_deref().filter(|t| t.len() > 1) {
                     Some(t) => { types.insert(*dst, t.to_string()); }
                     None => { types.remove(dst); }
@@ -219,6 +224,10 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
             Op::Sget { dst, class, field } => {
                 regs.insert(*dst, Lock::field(Root::Static(class.clone()), field.clone()));
                 types.remove(dst);
+                op = LockOp::Field { class: class.clone(), field: field.clone(), write: false };
+            }
+            Op::Iput { class, field, .. } | Op::Sput { class, field, .. } => {
+                op = LockOp::Field { class: class.clone(), field: field.clone(), write: true };
             }
             Op::ConstClass { dst, class } => {
                 regs.insert(*dst, Lock::new(Root::ClassConst(class.clone())));
@@ -389,6 +398,11 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
                                 f(Event::Release { lock: &lock, line, enter });
                             }
                         }
+                    }
+                }
+                LockOp::Field { class, field, write } => {
+                    if let Some(f) = emit.as_deref_mut() {
+                        f(Event::Field { class, field, write: *write, held: &st.locks, line });
                     }
                 }
                 LockOp::Call => {

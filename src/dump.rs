@@ -135,6 +135,71 @@ pub fn run_binder(inputs: &[PathBuf], scope: Option<&str>, closed_world: bool, o
     Ok(n)
 }
 
+/// `dexlock race`: analyze `inputs` and write every field whose locking discipline
+/// is inconsistent, as a JSON array. Returns the count.
+pub fn run_race(inputs: &[PathBuf], scope: Option<&str>, opts: &dex::race::Options, out: &Path) -> Result<usize> {
+    let t0 = Instant::now();
+    let dex = input::parse_inputs(inputs, scope).context("parsing dex inputs")?;
+    log::info!("parsed {} classes in {:.2?}", dex.classes.len(), t0.elapsed());
+
+    let t1 = Instant::now();
+    let findings = dex::race::races(&dex, opts);
+    log::info!("found {} inconsistently locked fields in {:.2?}", findings.len(), t1.elapsed());
+
+    #[derive(serde::Serialize)]
+    struct Acc<'a> {
+        method: &'a str,
+        file: Option<&'a str>,
+        line: Option<u32>,
+        write: bool,
+        held: &'a [String],
+        concurrent: bool,
+    }
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        field: &'a str,
+        guard: &'a str,
+        guarded: usize,
+        total: usize,
+        guarded_at: Vec<Acc<'a>>,
+        unguarded: Vec<Acc<'a>>,
+    }
+    fn acc(a: &dex::race::Access) -> Acc<'_> {
+        Acc {
+            method: &a.method,
+            file: a.file.as_deref(),
+            line: a.line,
+            write: a.write,
+            held: &a.held,
+            concurrent: a.concurrent,
+        }
+    }
+    let n = findings.len();
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut w = BufWriter::new(file);
+    w.write_all(b"[")?;
+    for (i, f) in findings.iter().enumerate() {
+        if i > 0 {
+            w.write_all(b",")?;
+        }
+        let row = Row {
+            field: &f.field,
+            guard: &f.guard,
+            guarded: f.guarded,
+            total: f.total,
+            // The discipline is corroborated by every guarded access; a handful is
+            // enough evidence to read, and the counts above carry the rest.
+            guarded_at: f.guarded_at.iter().take(5).map(acc).collect(),
+            unguarded: f.unguarded.iter().map(acc).collect(),
+        };
+        serde_json::to_writer(&mut w, &row)?;
+    }
+    w.write_all(b"]")?;
+    w.flush()?;
+    log::info!("wrote {n} findings to {} ({:.2?} total)", out.display(), t0.elapsed());
+    Ok(n)
+}
+
 /// Stream a JSON array of `{class, method, file, line, lock}` without a second copy.
 /// `file`+`line` are the `File.java:line` a monitor-contention record names.
 fn write_json(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
