@@ -29,6 +29,7 @@ use crate::dex::model::*;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
+pub mod apex;
 pub mod archive;
 pub mod binder;
 pub mod ctx;

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! Native extraction of DEX section blobs from the artifacts that actually carry
-//! dex: a bare `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), a
+//! dex: a bare `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), an APEX
+//! (`.apex`/`.capex`, whose `javalib/*.jar` are read out of the payload image), a
 //! directory of them, or a zip that nests more jars/apks. Archives are read in
 //! memory (no `unzip` subprocess, no temp files) and recognized by magic first,
 //! then extension, so an odd name still works.
@@ -45,6 +46,14 @@ fn collect_path(path: &Path, scope: Option<&str>, out: &mut Vec<Vec<u8>>) -> Res
     }
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
     let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if super::apex::is_apex_name(name) {
+        // An APEX carries its jars inside a filesystem image: unpack natively
+        // (deapexer as a fallback), then treat each jar as an input of its own.
+        for (jar, jar_bytes) in super::apex::javalib_jars_at(path, &bytes)? {
+            collect_bytes(&jar, jar_bytes, out, 1)?;
+        }
+        return Ok(());
+    }
     collect_bytes(name, bytes, out, 0)
 }
 
@@ -109,7 +118,7 @@ fn soong_jars(dir: &Path, scope: Option<&str>) -> Vec<PathBuf> {
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let p = e.path();
         let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
-        if matches!(ext, "jar" | "apk" | "zip" | "dex") {
+        if matches!(ext, "jar" | "apk" | "zip" | "dex" | "apex" | "capex") {
             out.push(p);
         }
     }

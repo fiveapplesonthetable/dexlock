@@ -209,6 +209,58 @@ fn fixture_cfg_held() {
     assert_eq!(idx.dist(caller_of("inExternal"), ma), None, "callee outside the inputs: assumed not held");
 }
 
+/// The native APEX readers on committed fixtures: an LZ4/compact-index erofs
+/// payload, its `.capex` wrapper, and an ext4 payload. Each yields the same two
+/// jars, and parsing the package as an input reaches the classes inside them.
+#[test]
+fn fixture_apex_native() {
+    for name in ["erofs.apex", "erofs.capex", "ext4.apex"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/apex").join(name);
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let jars = dex::apex::javalib_jars(&bytes).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        let names: Vec<&str> = jars.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["big.jar", "small.jar"], "{name}");
+        let (big, small) = (&jars[0].1, &jars[1].1);
+        assert!(big.len() > 4096 && small.len() < 4096, "{name}: sizes {} / {}", big.len(), small.len());
+        assert!(big.starts_with(b"PK\x03\x04") && small.starts_with(b"PK\x03\x04"), "{name}: not zips");
+        let d = dex::input::parse_inputs(&[path], None).unwrap_or_else(|e| panic!("{name}: {e:#}"));
+        let classes: Vec<&str> = d.classes.iter().map(|c| c.descriptor.as_str()).collect();
+        for want in ["t.Locks", "t.Cfg", "t.Ctx", "t.Binder$Holder"] {
+            assert!(classes.contains(&want), "{name}: missing {want}");
+        }
+    }
+}
+
+/// With `$DEXLOCK_APEX_DIR` pointing at a directory of `.apex`/`.capex` packages
+/// and `$DEXLOCK_DEAPEXER` at the host tool, the native APEX reader must return
+/// exactly the `javalib/*.jar` set deapexer extracts, byte for byte. Skipped
+/// otherwise.
+#[test]
+fn native_apex_matches_deapexer() {
+    let Some(dir) = std::env::var_os("DEXLOCK_APEX_DIR") else { return };
+    if std::env::var_os("DEXLOCK_DEAPEXER").is_none() {
+        return;
+    }
+    let mut checked = 0;
+    for e in std::fs::read_dir(dir).expect("apex dir").flatten() {
+        let p = e.path();
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !dex::apex::is_apex_name(name) {
+            continue;
+        }
+        let bytes = std::fs::read(&p).expect("read apex");
+        let native = dex::apex::javalib_jars(&bytes).unwrap_or_else(|e| panic!("{name}: native read failed: {e:#}"));
+        let reference = dex::apex::deapexer(&p).unwrap_or_else(|e| panic!("{name}: deapexer failed: {e:#}"));
+        let names = |v: &[(String, Vec<u8>)]| v.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&native), names(&reference), "{name}: jar set differs");
+        for ((n, a), (_, b)) in native.iter().zip(&reference) {
+            assert!(a == b, "{name}/{n}: contents differ ({} vs {} bytes)", a.len(), b.len());
+        }
+        checked += native.len();
+    }
+    eprintln!("native apex reader verified on {checked} jars");
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]

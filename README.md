@@ -249,9 +249,22 @@ no re-analysis. Rows are sorted, so the output is byte-deterministic.
 - **Compressed output**: give the output an `.gz` suffix (`-o locks.pb.gz`,
   `locks.json.gz`) to gzip it.
 
-**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), or a
-directory — including a zip that nests more jars/apks. They are extracted natively in
-memory (no `unzip` subprocess).
+**Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), an APEX
+(`.apex`, or compressed `.capex`), or a directory — including a zip that nests more
+jars/apks. They are extracted natively in memory (no `unzip` subprocess).
+
+An APEX carries its jars inside a filesystem image (`apex_payload.img`), so its
+`javalib/*.jar` are read out with an in-process **EROFS** reader (LZ4, legacy and
+compact index layouts — what `mkfs.erofs` produces for Android) or **ext4** reader
+(extent trees, block maps, 64-bit descriptors); a `.capex` is unwrapped first. No
+`deapexer`, `debugfs` or `fsck.erofs` subprocess is needed. If a payload uses a
+feature the native readers do not cover, `deapexer` is used as a fallback (found via
+`$DEXLOCK_DEAPEXER`, then `PATH`; its helpers via `$DEXLOCK_DEBUGFS` /
+`$DEXLOCK_FSCK_EROFS`, then beside `deapexer`). The native reader is verified
+byte-for-byte against `deapexer` on every APEX of an AOSP build (61 jars). With
+`system/framework` and `system/apex` both given, the whole system_server class
+space is in: 95,923 classes, 2.68M call sites, 99.94% of them linked, 0.06% into
+classes outside the inputs.
 
 ### `binder` — binder calls made while holding a lock
 
