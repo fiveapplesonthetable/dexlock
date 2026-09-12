@@ -29,7 +29,6 @@ use crate::dex::model::*;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-const ACC_SYNCHRONIZED: u32 = 0x20;
 const IINTERFACE: &str = "android.os.IInterface";
 
 /// A binder call made while holding a lock.
@@ -136,14 +135,11 @@ fn scan_method(m: &Method, ifaces: &HashSet<String>) -> Vec<Finding> {
         }
     }
 
+    // No seeding for `synchronized` methods: d8/R8 lower them to explicit
+    // monitor-enter/exit over the body (the DEX flag is the informational
+    // `ACC_DECLARED_SYNCHRONIZED` 0x20000, not the runtime-enforced 0x20), so the
+    // implicit monitor is already tracked by the MonitorEnter arm below.
     let mut held: Vec<Lock> = Vec::new();
-    if m.access & ACC_SYNCHRONIZED != 0 {
-        held.push(if m.is_static() {
-            Lock::new(Root::ClassConst(m.class.clone()))
-        } else {
-            Lock::new(Root::Recv(m.class.clone()))
-        });
-    }
     let ground = |l: &Lock| l.ground(&m.class, &m.key());
     // Only nameable (non-opaque) held locks: a `synchronized(param)` that doesn't
     // resolve intra-procedurally grounds to an opaque, which we don't report on.

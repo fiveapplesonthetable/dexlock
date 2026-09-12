@@ -28,6 +28,12 @@ class Binder {
             }
         }
 
+        // POSITIVE: a synchronized *method* (d8/R8 lower it to an explicit
+        // monitor-enter over the body, so `this` is held across the call).
+        synchronized void underSyncMethod() {
+            mFoo.doRemote();
+        }
+
         // NEGATIVE: same binder call, no lock held.
         void noLock() {
             mFoo.doRemote();
