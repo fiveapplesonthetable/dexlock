@@ -57,6 +57,23 @@ fn fixture_locks_resolve_natively() {
     );
 }
 
+/// The binder-under-lock pass flags exactly the one interface-dispatched binder
+/// call made while a lock is held, and neither the same call without a lock nor a
+/// plain (non-binder) helper called under the lock. Built from `fixtures/Binder.java`.
+#[test]
+fn fixture_binder_under_lock() {
+    let bytes = include_bytes!("fixtures/binder.dex");
+    let d = dex::parse_dex_blob(bytes).expect("parse fixture");
+    let f = dex::binder::binder_under_lock(&d);
+
+    assert_eq!(f.len(), 1, "expected one finding, got {:?}", f.iter().map(|x| &x.method).collect::<Vec<_>>());
+    let one = &f[0];
+    assert_eq!(one.method, "t.Binder$Holder.underLock:()V");
+    assert_eq!(one.file.as_deref(), Some("Binder.java"));
+    assert_eq!(one.held, vec!["t.Binder$Holder.mLock".to_string()]);
+    assert_eq!(one.callee, "t.Binder$IFoo.doRemote");
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]

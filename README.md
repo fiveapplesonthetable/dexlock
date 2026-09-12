@@ -202,7 +202,7 @@ implementations and the resolver, cache, and lookup are unchanged.
 
 ## CLI
 
-Two subcommands. `-j/--threads` bounds the worker pool for either (default: all cores).
+Three subcommands. `-j/--threads` bounds the worker pool for any of them (default: all cores).
 
 ### `resolve` — answer a contention CSV
 
@@ -252,6 +252,44 @@ no re-analysis. Rows are sorted, so the output is byte-deterministic.
 **Inputs** are `.dex`, a zip-family archive (`.jar`/`.apk`/`.zip`/`.aar`), or a
 directory — including a zip that nests more jars/apks. They are extracted natively in
 memory (no `unzip` subprocess).
+
+### `binder` — binder calls made while holding a lock
+
+Holding a lock across a synchronous binder transaction is a classic system_server
+hazard: the call blocks on another process (or an app callback), and every thread
+that wants the lock is stuck behind it — a common ANR and lock-inversion source.
+`binder` flags each such site.
+
+```sh
+dexlock binder services.jar framework.jar -o binder.json
+# --scope <substr> narrows a directory input; --dexdump <path> selects the back-end
+```
+
+A binder call is recognized structurally, not by name: an `IBinder.transact`, or a
+call **dispatched through** an AIDL interface (an `invoke-interface` on a type that
+transitively extends `android.os.IInterface`) or a generated `$Stub$Proxy`. A
+service invoking its own helper is `invoke-virtual`/`-direct` on the concrete impl —
+which merely happens to implement a `$Stub` — so restricting to interface dispatch
+excludes it. The held-lock set is tracked exactly as resolution tracks it
+(monitor-enter/exit, `Lock.lock`/`unlock`, and a `synchronized` method's implicit
+monitor).
+
+Output is a JSON array of `{method, file, line, held, callee}`, where `held` is the
+lock(s) demonstrably held at the call and `callee` is the binder method invoked, e.g.
+
+```json
+{"method":"…TelephonyRegistry.notifyActiveDataSubIdChanged:(I)V","file":"TelephonyRegistry.java",
+ "line":2776,"held":["com.android.server.TelephonyRegistry.mRecords"],
+ "callee":"com.android.internal.telephony.IPhoneStateListener.onActiveDataSubIdChanged"}
+```
+
+The pass is **intra-procedural**: it reports a lock held in the *same method* as the
+binder call, so it under-reports (it misses a lock held by a `…Locked` caller one
+frame up) rather than inventing findings — the opposite bias to a heuristic lint.
+Two caveats it cannot resolve statically: a binder whose service lives in the *same*
+process (e.g. a system_server-internal AIDL) is a local call, not a real IPC; and a
+`oneway` call does not block. Both are still reported, so treat findings as "a lock
+held across a potentially blocking IPC" — a ranked starting point, not a proof.
 
 ### The DEX front-end
 

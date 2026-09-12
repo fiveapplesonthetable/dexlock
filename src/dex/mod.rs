@@ -21,14 +21,16 @@
 //! A global phase then resolves lock-field aliases (a field that merely holds
 //! another object's lock is followed to that object, across constructors, setters
 //! and inheritance, as a monotone parameter/copy-propagation fixpoint) and names
-//! each site by its canonical lock. Deadlock-cycle, binder, and race analysis are
-//! out of scope.
+//! each site by its canonical lock. The `binder` module reuses the same held-lock
+//! tracking to flag binder calls made while a lock is held; deadlock-cycle and race
+//! analysis remain out of scope.
 
 use crate::dex::model::*;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod archive;
+pub mod binder;
 mod dexdump;
 mod extract;
 mod juc;

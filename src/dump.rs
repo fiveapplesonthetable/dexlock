@@ -93,6 +93,48 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
     Ok(n)
 }
 
+/// `dexlock binder`: analyze `inputs` and write every binder call made while a lock
+/// is held, as a JSON array. Returns the count.
+pub fn run_binder(inputs: &[PathBuf], scope: Option<&str>, out: &Path) -> Result<usize> {
+    let t0 = Instant::now();
+    let dex = input::parse_inputs(inputs, scope).context("parsing dex inputs")?;
+    log::info!("parsed {} classes in {:.2?}", dex.classes.len(), t0.elapsed());
+
+    let t1 = Instant::now();
+    let findings = dex::binder::binder_under_lock(&dex);
+    log::info!("found {} binder-under-lock sites in {:.2?}", findings.len(), t1.elapsed());
+
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        method: &'a str,
+        file: Option<&'a str>,
+        line: Option<u32>,
+        held: &'a [String],
+        callee: &'a str,
+    }
+    let n = findings.len();
+    let file = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
+    let mut w = BufWriter::new(file);
+    w.write_all(b"[")?;
+    for (i, f) in findings.iter().enumerate() {
+        if i > 0 {
+            w.write_all(b",")?;
+        }
+        let row = Row {
+            method: &f.method,
+            file: f.file.as_deref(),
+            line: f.line,
+            held: &f.held,
+            callee: &f.callee,
+        };
+        serde_json::to_writer(&mut w, &row)?;
+    }
+    w.write_all(b"]")?;
+    w.flush()?;
+    log::info!("wrote {n} findings to {} ({:.2?} total)", out.display(), t0.elapsed());
+    Ok(n)
+}
+
 /// Stream a JSON array of `{class, method, file, line, lock}` without a second copy.
 /// `file`+`line` are the `File.java:line` a monitor-contention record names.
 fn write_json(w: &mut impl Write, acqs: &[dex::Acquisition]) -> Result<()> {
