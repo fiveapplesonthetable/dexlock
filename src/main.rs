@@ -1,17 +1,21 @@
 //! dexlock CLI.
 //!
-//! Two subcommands:
+//! Subcommands:
 //!   * `resolve` — the portable path: read a contention CSV and resolve each source
 //!     site to its canonical lock against local artifacts.
 //!   * `dump` — analyze jars directly and emit *every* lock point, each resolved to
 //!     its canonical definition, as JSON or a compact columnar protobuf.
+//!   * `binder` — flag binder calls made while a lock is held.
+//!   * `ctx` — build and query the lock-context index (locks that may be held at a
+//!     line or method, the call path that brings each, and lock ordering).
 //!
-//! `-j/--threads` bounds the worker pool for either subcommand (default: all cores).
+//! `-j/--threads` bounds the worker pool for any subcommand (default: all cores).
 
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use dexlock::artifact::{ArtifactProvider, DirArtifactProvider, ZipArtifactProvider};
 use dexlock::dump::{self, Format};
+use dexlock::lockctx::{self, Query as CtxQuery};
 use dexlock::model::Query;
 use dexlock::pipeline::{self, Output};
 use dexlock::resolver::{Options, Resolver};
@@ -37,6 +41,82 @@ enum Cmd {
     Dump(DumpArgs),
     /// Flag binder calls made while holding a lock (a system_server ANR hazard).
     Binder(BinderArgs),
+    /// Lock-context index: which locks may be held at a line/method, via what
+    /// call path, and how locks order against each other.
+    Ctx(CtxArgs),
+}
+
+#[derive(Parser, Debug)]
+struct CtxArgs {
+    #[command(subcommand)]
+    cmd: CtxCmd,
+}
+
+#[derive(Subcommand, Debug)]
+enum CtxCmd {
+    /// Analyze jars/apks and write the index.
+    Build(CtxBuildArgs),
+    /// Query a built index.
+    Query(CtxQueryArgs),
+}
+
+#[derive(Parser, Debug)]
+struct CtxBuildArgs {
+    /// Jars / apks / `.dex` files / directories to analyze (merged).
+    #[arg(required = true)]
+    inputs: Vec<PathBuf>,
+
+    /// Narrow a directory input to jars whose name contains this substring.
+    #[arg(long)]
+    scope: Option<String>,
+
+    /// Output index path (add `.gz` to compress).
+    #[arg(long, short = 'o', default_value = "dexlock.ctx")]
+    output: PathBuf,
+
+    /// Link a virtual/interface call to its overrides only when the program has
+    /// at most this many declarations of that signature.
+    #[arg(long, default_value_t = 16)]
+    cha_cap: usize,
+
+    /// Furthest (in call frames) a held lock propagates down the call graph.
+    #[arg(long, default_value_t = 8)]
+    max_depth: u8,
+
+    /// Relate an acquisition only to locks taken within this many frames when
+    /// building the lock-order graph.
+    #[arg(long, default_value_t = 3)]
+    order_depth: u8,
+
+    /// Use the `dexdump` back-end instead of the native reader.
+    #[arg(long)]
+    dexdump: Option<PathBuf>,
+}
+
+#[derive(Parser, Debug)]
+struct CtxQueryArgs {
+    /// Index written by `ctx build`.
+    index: PathBuf,
+
+    /// A source position, `File.java:LINE`.
+    #[arg(long)]
+    at: Option<String>,
+
+    /// A method key (or substring of one), e.g. `ActivityManagerService.attachApplication`.
+    #[arg(long)]
+    method: Option<String>,
+
+    /// A lock name (or substring), e.g. `ActivityManagerService.mProcLock`.
+    #[arg(long)]
+    lock: Option<String>,
+
+    /// List lock-order cycles (deadlock candidates).
+    #[arg(long)]
+    cycles: bool,
+
+    /// Omit locks held more than this many call frames away.
+    #[arg(long, default_value_t = 4)]
+    depth: u8,
 }
 
 #[derive(Parser, Debug)]
@@ -162,6 +242,57 @@ fn main() -> Result<()> {
         Cmd::Resolve(a) => run_resolve(a),
         Cmd::Dump(a) => run_dump(a),
         Cmd::Binder(a) => run_binder(a),
+        Cmd::Ctx(a) => run_ctx(a),
+    }
+}
+
+fn run_ctx(args: CtxArgs) -> Result<()> {
+    match args.cmd {
+        CtxCmd::Build(a) => {
+            if let Some(d) = &a.dexdump {
+                std::env::set_var("DEXLOCK_DEXDUMP", d);
+                std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
+            }
+            let opts = dexlock::dex::ctx::Options { cha_cap: a.cha_cap, max_depth: a.max_depth, order_depth: a.order_depth };
+            let idx = lockctx::build(&a.inputs, a.scope.as_deref(), &opts, &a.output)?;
+            println!(
+                "Indexed {} methods, {} locks, {} order edges -> {}",
+                idx.methods.len(),
+                idx.locks.len(),
+                idx.order.len(),
+                a.output.display()
+            );
+            Ok(())
+        }
+        CtxCmd::Query(a) => {
+            let idx = lockctx::load(&a.index)?;
+            let mut out = std::io::stdout().lock();
+            let mut any = false;
+            if let Some(at) = &a.at {
+                let (file, line) = at
+                    .rsplit_once(':')
+                    .and_then(|(f, l)| l.parse::<u32>().ok().map(|l| (f.to_string(), l)))
+                    .ok_or_else(|| anyhow::anyhow!("--at expects File.java:LINE, got {at:?}"))?;
+                lockctx::query(&idx, &CtxQuery::At { file, line }, a.depth, &mut out)?;
+                any = true;
+            }
+            if let Some(m) = &a.method {
+                lockctx::query(&idx, &CtxQuery::Method(m.clone()), a.depth, &mut out)?;
+                any = true;
+            }
+            if let Some(l) = &a.lock {
+                lockctx::query(&idx, &CtxQuery::Lock(l.clone()), a.depth, &mut out)?;
+                any = true;
+            }
+            if a.cycles {
+                lockctx::query(&idx, &CtxQuery::Cycles, a.depth, &mut out)?;
+                any = true;
+            }
+            if !any {
+                anyhow::bail!("give one of --at, --method, --lock, --cycles");
+            }
+            Ok(())
+        }
     }
 }
 

@@ -90,6 +90,46 @@ fn fixture_binder_under_lock() {
     );
 }
 
+/// The lock-context index over `fixtures/ctx.dex`: mA may be held on entry to
+/// leaf() by the path top() -> mid() -> leaf(), and nested()/other() take mA and mB
+/// in opposite orders, so the lock-order graph has exactly the cycle {mA, mB}.
+#[test]
+fn fixture_ctx_index() {
+    let bytes = include_bytes!("fixtures/ctx.dex");
+    let d = dex::parse_dex_blob(bytes).expect("parse fixture");
+    let idx = dex::ctx::build(&d, &dex::ctx::Options::default());
+    let m = |k: &str| {
+        let v = idx.find_methods(k);
+        assert_eq!(v.len(), 1, "{k}");
+        v[0]
+    };
+    let l = |k: &str| {
+        let v = idx.find_locks(k);
+        assert_eq!(v.len(), 1, "{k}");
+        v[0]
+    };
+    let (top, mid, leaf) = (m("t.Ctx.top:"), m("t.Ctx.mid:"), m("t.Ctx.leaf:"));
+    let (ma, mb) = (l("t.Ctx.mA"), l("t.Ctx.mB"));
+
+    assert_eq!(idx.may_held(top), Vec::<(u32, u8)>::new());
+    assert_eq!(idx.may_held(mid), vec![(ma, 1)]);
+    assert_eq!(idx.may_held(leaf), vec![(ma, 2)]);
+    assert_eq!(idx.intra_held(top, 12), vec![ma]);
+
+    let path = idx.witness(leaf, ma).expect("mA reaches leaf");
+    assert_eq!(path.iter().map(|h| h.method).collect::<Vec<_>>(), vec![top, mid, leaf]);
+    assert_eq!((path[0].acquire, path[0].call), (Some(12), Some(12)));
+    assert_eq!((path[1].acquire, path[1].call), (None, Some(13)));
+    assert_eq!((path[2].acquire, path[2].call), (None, None));
+
+    let mut edges: Vec<(u32, u32)> = idx.order.iter().map(|e| (e.from, e.to)).collect();
+    edges.sort_unstable();
+    let mut want = vec![(ma, mb), (mb, ma)];
+    want.sort_unstable();
+    assert_eq!(edges, want);
+    assert_eq!(idx.cycles(), vec![vec![ma.min(mb), ma.max(mb)]]);
+}
+
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
 /// must produce identical resolution (the no-op guarantee). Skipped otherwise.
 #[test]

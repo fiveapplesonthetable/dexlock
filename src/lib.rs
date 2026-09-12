@@ -19,6 +19,7 @@ pub mod artifact;
 pub mod csv_io;
 pub mod dex;
 pub mod dump;
+pub mod lockctx;
 pub mod model;
 pub mod pipeline;
 pub mod proto;

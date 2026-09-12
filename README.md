@@ -202,7 +202,7 @@ implementations and the resolver, cache, and lookup are unchanged.
 
 ## CLI
 
-Three subcommands. `-j/--threads` bounds the worker pool for any of them (default: all cores).
+Four subcommands. `-j/--threads` bounds the worker pool for any of them (default: all cores).
 
 ### `resolve` — answer a contention CSV
 
@@ -314,6 +314,64 @@ Two caveats it cannot resolve statically: a binder whose service lives in the *s
 process (e.g. a system_server-internal AIDL) is a local call, not a real IPC; and a
 `oneway` call does not block. Both are still reported, so treat findings as "a lock
 held across a potentially blocking IPC" — a ranked starting point, not a proof.
+
+### `ctx` — which locks may be held here, and how they got here
+
+The lock-context index answers, for any **source line**, **method**, or **lock**:
+which locks may be held at that point, how many call frames away each was taken,
+the call path that brings it, and how locks order against each other. It is the
+substrate the other analyses can be phrased over (binder-under-lock, races,
+deadlock candidates), built once and queried in well under a second.
+
+```sh
+dexlock ctx build services.jar framework.jar -o sys.ctx     # ~10s; add .gz to compress
+dexlock ctx query sys.ctx --at ActivityManagerService.java:4600
+dexlock ctx query sys.ctx --method ActivityManagerService.attachApplicationLocked:
+dexlock ctx query sys.ctx --lock ActivityManagerService.mProcLock
+dexlock ctx query sys.ctx --cycles                            # lock-order SCCs
+# --depth N (default 4) omits locks held more than N frames away
+```
+
+A line or method query reports the locks the method itself holds at that line
+(with the acquiring line) and the locks that *may* be held on entry, each with its
+distance and a witness path from the acquiring frame:
+
+```
+ActivityManagerService.java:4589  in  …ActivityManagerService.attachApplicationLocked:(…)V
+  held by this method here: (none)
+  may be held on entry (from callers): 1 within 4 frame(s), 1 total
+    [d=1] com.android.server.am.ActivityManagerService
+      via …ActivityManagerService.attachApplication:(…)V  (acquires at ActivityManagerService.java:4922; calls at ActivityManagerService.java:4926)
+          -> …ActivityManagerService.attachApplicationLocked:(…)V
+```
+
+A lock query reports where it is acquired, the methods it may be held on entry to
+(nearest first), and its lock-order neighbours in both directions — each edge with
+a count, its distance, and an example site. `--cycles` lists the non-trivial
+strongly connected components of that order graph: sets of locks acquired in
+inconsistent orders, i.e. deadlock candidates, with the edges and sites that form
+them.
+
+How it works. Every method is walked once for its lock *spans* (each acquisition
+with the line range it is held over) and its call sites, each tagged with the locks
+held there. Call sites link to their static target and, for virtual/interface
+dispatch with a small implementation set (`--cha-cap`, default 16), to each
+override; a broad interface such as `Runnable.run` is left unlinked on purpose,
+since "every lock any caller holds" is noise. Lock names are the canonical
+identities from resolution, so a lock reached through an alias — `mGlobalLockWithoutBoost`
+is `mGlobalLock` — is one lock here. Over that graph the index solves, per method
+and lock, the fewest call frames from a holder (a min-plus fixpoint, cut at
+`--max-depth`, default 8). Distance is what makes a *may* analysis usable: without
+it a lock taken near the top of a service is "possibly held" in most of the
+program (60k methods for `mProcLock`, a 775-lock order cycle); ranked and bounded
+by distance, `mProcLock` has ~2.7k methods within 4 frames and the order graph is
+6.7k edges. The lock-order graph relates an acquisition only to locks held within
+`--order-depth` frames (default 3).
+
+Limits: a callback reached through a wide interface, a `Handler` post, reflection,
+or a lambda is not linked, so lock context does not flow into it; a *may* set is a
+superset, and every witness path is real but not necessarily the only or the
+common one.
 
 ### The DEX front-end
 

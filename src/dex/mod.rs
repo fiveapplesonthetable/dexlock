@@ -31,6 +31,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub mod archive;
 pub mod binder;
+pub mod ctx;
 mod dexdump;
 mod extract;
 mod flow;

@@ -53,10 +53,21 @@ const ACC_PRIVATE: u32 = 0x2;
 /// is only a backstop against a pathological call graph.
 const MAX_ROUNDS: usize = 16;
 
-/// Walk `m` maintaining the held-lock set (seeded with `entry`), invoking `on_call`
-/// at each non-lock `Invoke` with the locks held there (grounded) and the source
-/// line. Monitor-enter/exit and j.u.c `Lock.lock`/`unlock` adjust the held set.
-pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &[Lock], mut on_call: F) {
+/// One step of the held-lock walk over a method.
+pub(super) enum Event<'a> {
+    /// A lock was taken (monitor-enter / `Lock.lock`), grounded, at `line`.
+    Acquire { lock: &'a Lock, line: Option<u32> },
+    /// A lock was released (monitor-exit / `unlock`), at `line`.
+    Release { lock: &'a Lock, line: Option<u32> },
+    /// A non-lock call, with every lock held at that point (grounded).
+    Call { inv: &'a Invoke, held: &'a [Lock], line: Option<u32> },
+}
+
+/// Walk `m` maintaining the held-lock set (seeded with `entry`), reporting each
+/// acquire, release, and call in order. Monitor-enter/exit and j.u.c
+/// `Lock.lock`/`unlock` adjust the held set; a release pops the matching lock, or
+/// the innermost one when the operand register is untracked.
+pub(super) fn walk<F: FnMut(Event)>(m: &Method, entry: &[Lock], mut f: F) {
     let mut regs: HashMap<Reg, Lock> = HashMap::default();
     if let Some(t) = m.this_reg() {
         regs.insert(t, Lock::new(Root::This));
@@ -66,8 +77,19 @@ pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &
     }
     let ground = |l: &Lock| l.ground(&m.class, &m.key());
     let mut held: Vec<Lock> = entry.to_vec();
+    // Release: drop the named lock if held (innermost match), else the innermost.
+    fn release<F: FnMut(Event)>(held: &mut Vec<Lock>, name: Option<String>, line: Option<u32>, f: &mut F) {
+        let pos = match name.and_then(|n| held.iter().rposition(|h| h.name() == n)) {
+            Some(p) => p,
+            None if !held.is_empty() => held.len() - 1,
+            None => return,
+        };
+        let l = held.remove(pos);
+        f(Event::Release { lock: &l, line });
+    }
 
     for insn in &m.insns {
+        let line = m.line_at(insn.offset);
         match &insn.op {
             Op::Iget { dst, class, field, .. } => {
                 regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
@@ -87,34 +109,41 @@ pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &
             }
             Op::MonitorEnter(r) => {
                 if let Some(l) = regs.get(r).cloned() {
-                    held.push(ground(&l));
+                    let g = ground(&l);
+                    f(Event::Acquire { lock: &g, line });
+                    held.push(g);
                 }
             }
             Op::MonitorExit(r) => {
                 let name = regs.get(r).map(|l| ground(l).name());
-                match name.and_then(|n| held.iter().rposition(|h| h.name() == n)) {
-                    Some(pos) => { held.remove(pos); }
-                    None => { held.pop(); }
-                }
+                release(&mut held, name, line, &mut f);
             }
             Op::Invoke(inv) => match juc::classify(&inv.class, &inv.name) {
                 Some(LockCall::Acquire | LockCall::TryAcquire) => {
                     if let Some(l) = inv.args.first().and_then(|r| regs.get(r)).cloned() {
-                        held.push(ground(&l));
+                        let g = ground(&l);
+                        f(Event::Acquire { lock: &g, line });
+                        held.push(g);
                     }
                 }
                 Some(LockCall::Release) => {
-                    if let Some(n) = inv.args.first().and_then(|r| regs.get(r)).map(|l| ground(l).name()) {
-                        if let Some(pos) = held.iter().rposition(|h| h.name() == n) {
-                            held.remove(pos);
-                        }
-                    }
+                    let name = inv.args.first().and_then(|r| regs.get(r)).map(|l| ground(l).name());
+                    release(&mut held, name, line, &mut f);
                 }
-                _ => on_call(inv, &held, m.line_at(insn.offset)),
+                _ => f(Event::Call { inv, held: &held, line }),
             },
             _ => {}
         }
     }
+}
+
+/// [`walk`] restricted to calls: `on_call(invoke, held, line)`.
+pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &[Lock], mut on_call: F) {
+    walk(m, entry, |e| {
+        if let Event::Call { inv, held, line } = e {
+            on_call(inv, held, line);
+        }
+    });
 }
 
 /// Locks held on entry to each inferable method, computed interprocedurally. Keyed
