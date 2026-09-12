@@ -83,8 +83,10 @@ pub(super) enum Event<'a> {
     /// A lock was released (monitor-exit / `unlock`) at `line`; `enter` is the line
     /// of the acquisition it balances (`None` for a lock held on entry).
     Release { lock: &'a Lock, line: Option<u32>, enter: Option<u32> },
-    /// A non-lock call, with every lock held at that point (grounded).
-    Call { inv: &'a Invoke, held: &'a [Lock], line: Option<u32> },
+    /// A non-lock call, with every lock held at that point (grounded), and the
+    /// concrete or declared class of each argument register where known (receiver
+    /// first) — from `new-instance`, `this`, or a field's declared type.
+    Call { inv: &'a Invoke, held: &'a [Lock], line: Option<u32>, arg_types: &'a [Option<String>] },
 }
 
 /// The lock-relevant effect of one instruction, from the linear register pass.
@@ -180,30 +182,58 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
             regs.insert(t + j, Lock::new(Root::Param(j)));
         }
     }
+    // The class of the object in a register where the bytecode says: `this`, a
+    // `new-instance`, or an object field's declared type.
+    let mut types: HashMap<Reg, String> = HashMap::default();
+    if let Some(t) = m.this_reg() {
+        types.insert(t, m.class.clone());
+    }
     let mut last_ret: Option<Lock> = None;
     let mut ops: Vec<LockOp> = Vec::with_capacity(n);
+    let mut call_types: Vec<Vec<Option<String>>> = Vec::with_capacity(n);
     for insn in &m.insns {
         let mut op = LockOp::None;
+        let mut arg_types = Vec::new();
         match &insn.op {
-            Op::Iget { dst, class, field, .. } => {
+            Op::Iget { dst, class, field, ty, .. } => {
                 regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
+                match ty.as_deref().filter(|t| t.len() > 1) {
+                    Some(t) => { types.insert(*dst, t.to_string()); }
+                    None => { types.remove(dst); }
+                }
             }
             Op::Sget { dst, class, field } => {
                 regs.insert(*dst, Lock::field(Root::Static(class.clone()), field.clone()));
+                types.remove(dst);
             }
             Op::ConstClass { dst, class } => {
                 regs.insert(*dst, Lock::new(Root::ClassConst(class.clone())));
+                types.remove(dst);
             }
-            Op::Move { dst, src } => match regs.get(src).cloned() {
-                Some(v) => { regs.insert(*dst, v); }
-                None => { regs.remove(dst); }
-            },
-            Op::MoveResult { dst } => match last_ret.take() {
-                Some(v) => { regs.insert(*dst, v); }
-                None => { regs.remove(dst); }
-            },
-            Op::NewInstance { dst, .. } | Op::Def(dst) => {
+            Op::Move { dst, src } => {
+                match regs.get(src).cloned() {
+                    Some(v) => { regs.insert(*dst, v); }
+                    None => { regs.remove(dst); }
+                }
+                match types.get(src).cloned() {
+                    Some(t) => { types.insert(*dst, t); }
+                    None => { types.remove(dst); }
+                }
+            }
+            Op::MoveResult { dst } => {
+                match last_ret.take() {
+                    Some(v) => { regs.insert(*dst, v); }
+                    None => { regs.remove(dst); }
+                }
+                types.remove(dst);
+            }
+            Op::NewInstance { dst, class } => {
                 regs.remove(dst);
+                types.insert(*dst, class.clone());
+            }
+            Op::Def(dst) => {
+                regs.remove(dst);
+                types.remove(dst);
             }
             // An unknown operand still pushes (an opaque) so exits stay balanced.
             Op::MonitorEnter(r) => {
@@ -222,12 +252,16 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
                         op = LockOp::Acquire(arg0.map(ground).unwrap_or_else(|| opaque(insn.offset)));
                     }
                     Some(LockCall::Release) => op = LockOp::Release(arg0.map(ground)),
-                    None => op = LockOp::Call,
+                    None => {
+                        op = LockOp::Call;
+                        arg_types = inv.args.iter().map(|r| types.get(r).cloned()).collect();
+                    }
                 }
             }
             _ => {}
         }
         ops.push(op);
+        call_types.push(arg_types);
     }
 
     // 2. Basic blocks over the instruction list.
@@ -305,7 +339,7 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
     // 3. Forward dataflow of the held stack, intersection join.
     let transfer = |st: &mut State, b: usize, mut emit: Option<&mut F>| {
         let (bs, be) = blocks[b];
-        for (insn, op) in m.insns[bs..be].iter().zip(&ops[bs..be]) {
+        for ((insn, op), arg_types) in m.insns[bs..be].iter().zip(&ops[bs..be]).zip(&call_types[bs..be]) {
             let line = m.line_at(insn.offset);
             match op {
                 LockOp::Enter(l) | LockOp::Acquire(l) => {
@@ -335,7 +369,7 @@ fn run<F: FnMut(Event)>(m: &Method, entry: &[Lock], effects: &Effects, mut emit:
                 LockOp::Call => {
                     let Op::Invoke(inv) = &insn.op else { continue };
                     if let Some(f) = emit.as_deref_mut() {
-                        f(Event::Call { inv, held: &st.locks, line });
+                        f(Event::Call { inv, held: &st.locks, line, arg_types });
                     }
                     // A helper's net effect: it may release for us, or return holding.
                     if let Some(eff) = effects.get(&inv.key()) {
@@ -444,7 +478,7 @@ pub(super) fn effects(dex: &Dex) -> Effects {
 /// [`walk`] restricted to calls: `on_call(invoke, held, line)`.
 pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &[Lock], effects: &Effects, mut on_call: F) {
     walk(m, entry, effects, |e| {
-        if let Event::Call { inv, held, line } = e {
+        if let Event::Call { inv, held, line, .. } = e {
             on_call(inv, held, line);
         }
     });

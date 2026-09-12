@@ -367,7 +367,15 @@ holding it, `releaseFooLock()`) is tracked too: each method's net lock effect on
 caller is solved as a fixpoint and applied at its call sites. Call sites link to their static target and, for virtual/interface
 dispatch with a small implementation set (`--cha-cap`, default 16), to each
 override; a broad interface such as `Runnable.run` is left unlinked on purpose,
-since "every lock any caller holds" is noise. Lock names are the canonical
+since "every lock any caller holds" is noise. When the receiver's concrete class is
+known from the bytecode (`new`, `this`, a field's declared type) the call is
+devirtualized to that one method instead. A lambda or anonymous class passed to a
+call that runs it synchronously (`forEach`, `computeIfAbsent`, …) is linked as a
+callee, so a callback body inherits the block's locks; one handed to a `post`,
+`execute`, `submit`, `schedule`, `add`/`register`/`set`… sink is not, since it runs
+later without them. On `services.jar` + `framework.jar`: 1.56M call sites, 1.08M
+linked (12.6k devirtualized, 69k callback edges), 472k into classes outside the
+inputs, 0.4% unlinked by wide dispatch. Lock names are the canonical
 identities from resolution, so a lock reached through an alias — `mGlobalLockWithoutBoost`
 is `mGlobalLock` — is one lock here. Over that graph the index solves, per method
 and lock, the fewest call frames from a holder (a min-plus fixpoint, cut at
@@ -378,8 +386,9 @@ by distance, `mProcLock` has ~2.7k methods within 4 frames and the order graph i
 6.7k edges. The lock-order graph relates an acquisition only to locks held within
 `--order-depth` frames (default 3).
 
-Limits: a callback reached through a wide interface, a `Handler` post, reflection,
-or a lambda is not linked, so lock context does not flow into it; a *may* set is a
+Limits: a callback reached only through a wide interface, or through reflection, is
+not linked, so lock context does not flow into it; whether an external API runs a
+callback synchronously is decided by the sink-name list above; a *may* set is a
 superset, and every witness path is real but not necessarily the only or the
 common one.
 

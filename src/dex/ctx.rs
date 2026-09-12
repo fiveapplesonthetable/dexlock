@@ -164,12 +164,38 @@ struct RawCall {
     kind: InvokeKind,
     line: u32,
     held: Vec<u32>,
+    /// The receiver's known class when it is more specific than the static type.
+    recv_ty: Option<String>,
+    /// Lambda / anonymous classes passed as arguments — callbacks the callee may run.
+    callbacks: Vec<String>,
 }
+
+/// A call as recorded by the walk: (class, name, sig, kind, line, held, recv_ty, callbacks).
+type WalkCall = (String, String, String, InvokeKind, u32, Vec<String>, Option<String>, Vec<String>);
 
 /// Per-method output of the parallel walk, before global interning.
 struct Scanned {
     spans: Vec<(String, u32, u32, Vec<String>)>,
-    calls: Vec<(String, String, String, InvokeKind, u32, Vec<String>)>,
+    calls: Vec<WalkCall>,
+}
+
+/// A d8-desugared lambda (`Outer$$ExternalSyntheticLambdaN`) or an anonymous inner
+/// class (`Outer$N`): an object whose only purpose is to be called back.
+fn is_callback_class(c: &str) -> bool {
+    if c.contains("$$ExternalSyntheticLambda") {
+        return true;
+    }
+    c.rsplit('$').next().is_some_and(|last| !last.is_empty() && last.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Calls that take a callback to run *later* (or to register it), so a lock held
+/// at the call is not held when the callback runs: no edge into it.
+fn is_async_sink(name: &str) -> bool {
+    const ASYNC: [&str; 17] = [
+        "post", "send", "execute", "submit", "schedule", "start", "add", "register", "set", "put",
+        "offer", "enqueue", "queue", "observe", "subscribe", "listen", "<",
+    ];
+    ASYNC.iter().any(|p| name.starts_with(p))
 }
 
 pub fn build(dex: &Dex, opts: &Options) -> Index {
@@ -256,10 +282,13 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
                         sp.0 = Some(sp.0.map_or(x, |e| e.max(x)));
                     }
                 }
-                Event::Call { inv, held, line } => {
+                Event::Call { inv, held, line, arg_types } => {
                     let line = line.unwrap_or(NO_LINE);
                     let held = named(held, line, &mut name_of);
-                    calls.push((inv.class.clone(), inv.name.clone(), inv.sig.clone(), inv.kind, line, held));
+                    let recv_ty = if inv.kind == InvokeKind::Static { None } else { arg_types.first().cloned().flatten() };
+                    let callbacks: Vec<String> =
+                        arg_types.iter().flatten().filter(|c| is_callback_class(c)).cloned().collect();
+                    calls.push((inv.class.clone(), inv.name.clone(), inv.sig.clone(), inv.kind, line, held, recv_ty, callbacks));
                 }
             });
             let spans = order
@@ -316,9 +345,18 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             })
             .collect();
         let c0 = raw_calls.len() as u32;
-        for (class, name, sig, kind, line, held) in s.calls {
+        for (class, name, sig, kind, line, held, recv_ty, callbacks) in s.calls {
             let held = held.iter().map(|h| intern(h, &mut locks, &mut lock_id)).collect();
-            raw_calls.push(RawCall { caller: i as u32, class, sig: format!("{name}:{sig}"), kind, line, held });
+            raw_calls.push(RawCall {
+                caller: i as u32,
+                class,
+                sig: format!("{name}:{sig}"),
+                kind,
+                line,
+                held,
+                recv_ty,
+                callbacks,
+            });
         }
         recs.push(MethodRec {
             key: m.key(),
@@ -364,21 +402,46 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
     }
     // Static target: a class at or above `class` declaring name:sig.
     let mut static_memo: HashMap<(String, String), Option<u32>> = HashMap::default();
+    // Memos are passed in rather than captured so the override-linking loop below
+    // can use the ancestor memo too.
+    let resolve_from = |anc_memo: &mut HashMap<String, HashSet<String>>,
+                        static_memo: &mut HashMap<(String, String), Option<u32>>,
+                        class: &str,
+                        sigk: &str|
+     -> Option<u32> {
+        if let Some(&t) = id_of.get(&format!("{class}.{sigk}")) {
+            return Some(t);
+        }
+        *static_memo.entry((class.to_string(), sigk.to_string())).or_insert_with(|| {
+            let anc = anc_memo.entry(class.to_string()).or_insert_with(|| ancestors(class));
+            anc.iter().find_map(|a| id_of.get(&format!("{a}.{sigk}")).copied())
+        })
+    };
+    // Instance methods per class, for callback edges into lambda / anonymous classes.
+    let mut methods_of: HashMap<&str, Vec<u32>> = HashMap::default();
+    for (i, m) in methods.iter().enumerate() {
+        if !m.name.starts_with('<') && !m.is_static() {
+            methods_of.entry(m.class.as_str()).or_default().push(i as u32);
+        }
+    }
 
     let class_set: HashSet<&str> = dex.classes.iter().map(|c| c.descriptor.as_str()).collect();
-    let (mut external, mut unlinked) = (0usize, 0usize);
+    let (mut external, mut unlinked, mut devirt, mut callback_edges) = (0usize, 0usize, 0usize, 0usize);
     let mut calls: Vec<Call> = Vec::with_capacity(raw_calls.len());
-    for RawCall { caller, class, sig: sigk, kind, line, held } in raw_calls {
-        let exact = id_of.get(&format!("{class}.{sigk}")).copied();
-        let stat = match exact {
-            Some(t) => Some(t),
-            None => *static_memo.entry((class.clone(), sigk.clone())).or_insert_with(|| {
-                let anc = anc_memo.entry(class.clone()).or_insert_with(|| ancestors(&class));
-                anc.iter().find_map(|a| id_of.get(&format!("{a}.{sigk}")).copied())
-            }),
+    for RawCall { caller, class, sig: sigk, kind, line, held, recv_ty, callbacks } in raw_calls {
+        // A receiver whose concrete class is known dispatches to exactly one method.
+        let precise = recv_ty
+            .as_deref()
+            .filter(|t| *t != class && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface))
+            .and_then(|t| resolve_from(&mut anc_memo, &mut static_memo, t, &sigk));
+        let mut targets: Vec<u32> = match precise {
+            Some(t) => {
+                devirt += 1;
+                vec![t]
+            }
+            None => resolve_from(&mut anc_memo, &mut static_memo, &class, &sigk).into_iter().collect(),
         };
-        let mut targets: Vec<u32> = stat.into_iter().collect();
-        if matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
+        if precise.is_none() && matches!(kind, InvokeKind::Virtual | InvokeKind::Interface) {
             if let Some(ds) = decl.get(&sigk) {
                 if ds.len() <= opts.cha_cap {
                     for &d in ds {
@@ -399,13 +462,26 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
             }
         }
         let none = targets.is_empty();
+        // A callback passed to a call that runs it synchronously (`forEach`,
+        // `computeIfAbsent`, ...) runs under the caller's locks: link its methods.
+        let name = sigk.split(':').next().unwrap_or("");
+        if !callbacks.is_empty() && !is_async_sink(name) {
+            for cb in &callbacks {
+                for &t in methods_of.get(cb.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
+                    if !targets.contains(&t) {
+                        targets.push(t);
+                        callback_edges += 1;
+                    }
+                }
+            }
+        }
         calls.push(Call { caller, line, held, targets });
         if none {
             if class_set.contains(class.as_str()) { unlinked += 1 } else { external += 1 }
         }
     }
     log::info!(
-        "ctx: {} call sites: {} linked, {} into classes outside the inputs, {} unlinked (wide dispatch or missing declaration)",
+        "ctx: {} call sites: {} linked ({devirt} devirtualized by receiver type, {callback_edges} callback edges), {} into classes outside the inputs, {} unlinked (wide dispatch or missing declaration)",
         calls.len(),
         calls.len() - external - unlinked,
         external,

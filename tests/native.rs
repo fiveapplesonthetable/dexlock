@@ -157,7 +157,8 @@ fn fixture_ctx_binder_sites() {
 /// Control-flow-aware held-lock tracking over `fixtures/cfg.dex`: the locks held at
 /// each helper call are exactly those of its enclosing block, across an early
 /// return, a catch handler, try/finally, a switch, a loop, a successful `tryLock`,
-/// a read-write lock view, and a lock taken/released through helper methods.
+/// a read-write lock view, a lock taken/released through helper methods, and lambdas
+/// run synchronously (`forEach`) versus posted to a sink.
 #[test]
 fn fixture_cfg_held() {
     let bytes = include_bytes!("fixtures/cfg.dex");
@@ -193,6 +194,16 @@ fn fixture_cfg_held() {
     assert_eq!(held_at("afterRead"), Vec::<String>::new());
     assert_eq!(held_at("inHelperLock"), vec!["t.Cfg.mL".to_string()], "lock taken by a helper is held after it returns");
     assert_eq!(held_at("afterHelper"), Vec::<String>::new(), "lock released by a helper");
+
+    // A lambda run synchronously by `forEach` inherits the block's lock (a callback
+    // edge from the call site); one handed to a `post(...)` sink does not.
+    let ma = idx.find_locks("t.Cfg.mA")[0];
+    let caller_of = |callee: &str| -> u32 {
+        let t = idx.find_methods(&format!("t.Cfg.{callee}:()V"))[0];
+        idx.calls.iter().find(|c| c.targets.contains(&t)).expect("called").caller
+    };
+    assert!(idx.dist(caller_of("inLambda"), ma).is_some(), "forEach lambda runs under mA");
+    assert_eq!(idx.dist(caller_of("inPosted"), ma), None, "posted lambda does not");
 }
 
 /// When `$DEXLOCK_DEXDUMP` points at a `dexdump`, the native and dexdump front-ends
