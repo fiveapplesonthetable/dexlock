@@ -206,7 +206,13 @@ fn report_point(idx: &Index, m: u32, line: u32, depth: u8, w: &mut impl Write) -
         writeln!(w, "  held by this method here:")?;
         for l in intra {
             let at = r.spans.iter().filter(|s| s.lock == l && s.enter <= line && line < s.exit).map(|s| s.enter).next();
-            writeln!(w, "    {}   (acquired at {})", idx.locks[l as usize], at.map(|a| loc(idx, m, a)).unwrap_or_default())?;
+            // A `synchronized` method's monitor is entered before the first line
+            // number exists, so it is held from entry rather than at any line.
+            let at = match at {
+                Some(0) | None => "on entry to the method".to_string(),
+                Some(a) => format!("at {}", loc(idx, m, a)),
+            };
+            writeln!(w, "    {}   (acquired {at})", idx.locks[l as usize])?;
         }
     }
     let may = idx.may_held(m);

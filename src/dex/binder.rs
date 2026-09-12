@@ -15,7 +15,8 @@
 //! Binder-call-while-locked: flag a (potentially blocking) binder transaction made
 //! while holding a lock — a classic system_server ANR / lock-inversion source.
 //!
-//! A binder call is recognized structurally: an invoke of `IBinder.transact`, or an
+//! A binder call is recognized structurally: an invoke of `IBinder.transact`, an
+//! invoke of a method whose body performs one (the generated client proxy), or an
 //! invoke of a method on an AIDL interface (a type transitively extending
 //! `android.os.IInterface`) — that is the client surface whose call does a
 //! synchronous transact. The held-lock set is tracked exactly as elsewhere
@@ -47,6 +48,7 @@ pub struct Finding {
 /// private methods to any uniquely-signed one (see `flow::entry_held`).
 pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
     let ifaces = binder_interfaces(dex);
+    let transacting = transacting_methods(dex);
     let entry = flow::entry_held(dex, closed_world);
     let effects = flow::effects(dex);
     let empty: Vec<Lock> = Vec::new();
@@ -58,7 +60,7 @@ pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
             let seed = entry.get(&m.key()).unwrap_or(&empty);
             let mut fs = Vec::new();
             flow::scan(m, seed, &effects, |inv, held, line| {
-                if is_binder_call(inv, &ifaces) && held.iter().any(|l| !l.is_opaque()) {
+                if is_binder_call(inv, &ifaces, &transacting) && held.iter().any(|l| !l.is_opaque()) {
                     fs.push(Finding {
                         method: m.key(),
                         file: m.source_file.clone(),
@@ -73,6 +75,25 @@ pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
         .collect();
     out.sort_by(|a, b| (&a.method, a.line, &a.callee).cmp(&(&b.method, b.line, &b.callee)));
     out
+}
+
+/// True if this invoke is the low-level binder transaction itself.
+pub(super) fn is_transact(inv: &Invoke) -> bool {
+    matches!(inv.class.as_str(), "android.os.IBinder" | "android.os.BinderProxy")
+        && inv.name.starts_with("transact")
+}
+
+/// Methods whose body performs a binder transaction — the generated client proxies,
+/// found by what they do rather than by what they are called.
+pub(super) fn transacting_methods(dex: &Dex) -> HashSet<String> {
+    dex.classes
+        .iter()
+        .flat_map(|c| c.methods.iter())
+        .filter(|m| {
+            m.insns.iter().any(|i| matches!(&i.op, Op::Invoke(inv) if is_transact(inv)))
+        })
+        .map(|m| m.key())
+        .collect()
 }
 
 /// Classes that transitively extend `android.os.IInterface` — the AIDL surface.
@@ -129,18 +150,19 @@ pub(super) fn binder_interfaces(dex: &Dex) -> HashSet<String> {
 /// transitively extends `IInterface`) or into a generated `$Stub$Proxy` — that is
 /// the client surface whose call blocks on a synchronous transact. A service
 /// invoking its *own* helper is `invoke-virtual`/`-direct` on the concrete impl
-/// (which merely happens to implement a `$Stub`); that is a local call, not a
+/// (which merely happens to implement a generated stub); that is a local call, not a
 /// transaction, so restricting to interface dispatch excludes it. Static factories
 /// (`asInterface`, `Stub.getDefaultImpl`) and the non-transacting `IInterface`
-/// plumbing never count.
-fn is_binder_call(inv: &Invoke, ifaces: &HashSet<String>) -> bool {
-    if inv.class == "android.os.IBinder" && inv.name.starts_with("transact") {
+/// plumbing never count. The proxy is recognized by its body performing a
+/// transaction, not by its class name.
+fn is_binder_call(inv: &Invoke, ifaces: &HashSet<String>, transacting: &HashSet<String>) -> bool {
+    if is_transact(inv) {
         return true;
     }
     if inv.name.starts_with('<') || inv.name == "asBinder" || inv.name == "getInterfaceDescriptor" {
         return false;
     }
-    if inv.class.ends_with("$Stub$Proxy") {
+    if transacting.contains(&inv.key()) {
         return true;
     }
     inv.kind == InvokeKind::Interface && ifaces.contains(&inv.class)

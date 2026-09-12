@@ -268,8 +268,8 @@ the two are cross-checked. The native reader is verified byte-for-byte against
 `system/apex` produces identical output either way (7,511 lock points), the
 native path in 6.6 s against 15.4 s. With
 `system/framework` and `system/apex` both given, the whole system_server class
-space is in: 95,923 classes, 2.68M call sites, 99.94% of them linked, 0.06% into
-classes outside the inputs.
+space is in: 93,601 classes (2,322 duplicate copies dropped), 2.61M call sites,
+99.94% of them linked, 0.06% into classes outside the inputs.
 
 ### `binder` — binder calls made while holding a lock
 
@@ -397,22 +397,21 @@ that only *stores* its argument (`Handler.post`, a listener registry) invokes no
 and links nothing. There is no list of "async" method names: what runs a callback
 is read from the code. A callee outside the inputs (`java.util.List.forEach`)
 cannot be inspected, so the lock is assumed **not** held through it — an
-under-approximation, never an invention; include the jar to close that gap. On `services.jar` + `framework.jar`: 1.56M call sites, 1.08M
-linked (12.6k devirtualized, 69k callback edges), 472k into classes outside the
-inputs, 0.4% unlinked by wide dispatch. Lock names are the canonical
+under-approximation, never an invention; include the jar to close that gap. On `system/framework` + `system/apex`: 2.61M call sites,
+2.61M linked (46k devirtualized by receiver type, 40k resolved by parameter
+type-flow), 1,680 into classes outside the inputs, 17 unlinked by wide dispatch. Lock names are the canonical
 identities from resolution, so a lock reached through an alias — `mGlobalLockWithoutBoost`
 is `mGlobalLock` — is one lock here. Over that graph the index solves, per method
 and lock, the fewest call frames from a holder (a min-plus fixpoint, cut at
 `--max-depth`, default 8). Distance is what makes a *may* analysis usable: without
 it a lock taken near the top of a service is "possibly held" in most of the
 program (60k methods for `mProcLock`, a 775-lock order cycle); ranked and bounded
-by distance, `mProcLock` has ~2.7k methods within 4 frames and the order graph is
-6.7k edges. The lock-order graph relates an acquisition only to locks held within
+by distance the order graph is 8.0k edges. The lock-order graph relates an acquisition only to locks held within
 `--order-depth` frames (default 3), and ignores a *reentrant* acquisition — a lock
 the method or a caller already holds orders nothing, and treating it as a fresh
 acquisition manufactures inversions out of nested `First → Second` blocks re-entered
 from a callee. On all 40 `system/framework` jars that filter takes the inversion list
-from 85 pairs to 18 (15 with no common outer lock), each backed by two witness sites.
+from 85 pairs to 28 (23 with no common outer lock), each backed by two witness sites.
 
 Limits: a callback reached only through a wide interface on a non-parameter
 receiver, or through reflection, is not linked, so lock context does not flow into

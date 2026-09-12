@@ -166,7 +166,17 @@ impl Method {
         }
         out
     }
-    /// Source line for a code offset (largest position <= offset).
+    /// Source line for a code offset: the largest position at or before it, and
+    /// `None` when there is none.
+    ///
+    /// Returning `None` rather than the first line is deliberate. ART resolves a pc
+    /// the same way (`CodeItemDebugInfoAccessor::GetLineNumForPc` walks positions in
+    /// ascending address order, stops once one is past the pc, and starts from -1),
+    /// so a site the runtime cannot name is one this cannot name either — which is
+    /// what keeps a contention record's `File.java:line` joinable with a dump. The
+    /// case that reaches this is a `synchronized` method: d8 lowers it to a
+    /// `monitor-enter` at offset 0, before the first position, so the acquisition
+    /// has no line. The lock is still tracked across the whole body.
     pub fn line_at(&self, offset: u32) -> Option<u32> {
         let mut best = None;
         for &(off, line) in &self.positions {

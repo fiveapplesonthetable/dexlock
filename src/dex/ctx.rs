@@ -198,9 +198,10 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
     let id_of: HashMap<String, u32> =
         methods.iter().enumerate().map(|(i, m)| (m.key(), i as u32)).collect();
     let ifaces = super::binder::binder_interfaces(dex);
-    // Remote binder entries. A concrete service that happens to implement a $Stub
-    // is not one: only abstract AIDL methods (reached by interface dispatch), the
-    // generated client proxy, and the raw transact block on IPC.
+    let transacting = super::binder::transacting_methods(dex);
+    // Remote binder entries. A concrete service that happens to implement a generated
+    // stub is not one: only abstract AIDL methods (reached by interface dispatch),
+    // a method that performs a transaction, and the raw transact that blocks on IPC.
     let is_binder = |m: &Method| -> bool {
         if m.class == "android.os.IBinder" && m.name.starts_with("transact") {
             return true;
@@ -208,7 +209,7 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
         if m.name.starts_with('<') || m.name == "asBinder" || m.name == "getInterfaceDescriptor" {
             return false;
         }
-        m.class.ends_with("$Stub$Proxy") || (m.access & ACC_ABSTRACT != 0 && ifaces.contains(&m.class))
+        transacting.contains(&m.key()) || (m.access & ACC_ABSTRACT != 0 && ifaces.contains(&m.class))
     };
 
     // Canonical lock per acquisition site, shared with resolution: (method, line)
