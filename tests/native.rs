@@ -58,10 +58,11 @@ fn fixture_locks_resolve_natively() {
 }
 
 /// The binder-under-lock pass flags exactly the interface-dispatched binder calls
-/// made while a lock is held — both a `synchronized` block (holding a field lock)
-/// and a `synchronized` method (holding `this`, which d8 lowers to an explicit
-/// monitor) — and neither the same call without a lock nor a plain (non-binder)
-/// helper called under the lock. Built from `fixtures/Binder.java`.
+/// made while a lock is held: a `synchronized` block (a field lock), a `synchronized`
+/// method (holding `this`, which d8 lowers to an explicit monitor), and — the
+/// interprocedural case — a binder call in a private helper whose caller holds the
+/// lock (`entry_held` infers it one frame up). Neither the same call without a lock
+/// nor a plain (non-binder) helper under the lock is flagged. From `Binder.java`.
 #[test]
 fn fixture_binder_under_lock() {
     let bytes = include_bytes!("fixtures/binder.dex");
@@ -74,19 +75,17 @@ fn fixture_binder_under_lock() {
         })
         .collect();
     got.sort();
+    let remote = "t.Binder$IFoo.doRemote".to_string();
+    let mlock = vec!["t.Binder$Holder.mLock".to_string()];
     assert_eq!(
         got,
         vec![
-            (
-                "t.Binder$Holder.underLock:()V".to_string(),
-                vec!["t.Binder$Holder.mLock".to_string()],
-                "t.Binder$IFoo.doRemote".to_string()
-            ),
-            (
-                "t.Binder$Holder.underSyncMethod:()V".to_string(),
-                vec!["t.Binder$Holder".to_string()],
-                "t.Binder$IFoo.doRemote".to_string()
-            ),
+            // interprocedural: lock held by the caller of a private helper
+            ("t.Binder$Holder.helperLocked:()V".to_string(), mlock.clone(), remote.clone()),
+            // intra: synchronized block holding a field lock
+            ("t.Binder$Holder.underLock:()V".to_string(), mlock, remote.clone()),
+            // intra: synchronized method holding `this`
+            ("t.Binder$Holder.underSyncMethod:()V".to_string(), vec!["t.Binder$Holder".to_string()], remote),
         ]
     );
 }

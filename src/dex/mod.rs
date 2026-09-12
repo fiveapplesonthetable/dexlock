@@ -33,6 +33,7 @@ pub mod archive;
 pub mod binder;
 mod dexdump;
 mod extract;
+mod flow;
 mod juc;
 mod native;
 pub mod input;

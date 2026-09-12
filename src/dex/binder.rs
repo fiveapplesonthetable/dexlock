@@ -24,7 +24,7 @@
 //! made from a `…Locked` helper whose lock is held by the caller) rather than
 //! over-reporting: a finding is a lock demonstrably held across a binder call.
 
-use crate::dex::juc::{self, LockCall};
+use crate::dex::flow;
 use crate::dex::model::*;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
@@ -40,18 +40,36 @@ pub struct Finding {
     pub callee: String,
 }
 
-/// Find every binder call made while a lock is held.
+/// Find every binder call made while a lock is held. Held locks include those taken
+/// intra-procedurally (monitor / `Lock.lock`) and those inferred to be held on entry
+/// to a private method by [`flow::entry_held`], so a call in a `…Locked` helper whose
+/// lock is taken one frame up is still caught.
 pub fn binder_under_lock(dex: &Dex) -> Vec<Finding> {
     let ifaces = binder_interfaces(dex);
+    let entry = flow::entry_held(dex);
+    let empty: Vec<Lock> = Vec::new();
     let mut out: Vec<Finding> = dex
         .classes
         .par_iter()
         .flat_map_iter(|c| c.methods.iter())
-        .flat_map(|m| scan_method(m, &ifaces))
+        .flat_map(|m| {
+            let seed = entry.get(&m.key()).unwrap_or(&empty);
+            let mut fs = Vec::new();
+            flow::scan(m, seed, |inv, held, line| {
+                if is_binder_call(inv, &ifaces) && held.iter().any(|l| !l.is_opaque()) {
+                    fs.push(Finding {
+                        method: m.key(),
+                        file: m.source_file.clone(),
+                        line,
+                        held: held.iter().filter(|l| !l.is_opaque()).map(|l| l.name()).collect(),
+                        callee: format!("{}.{}", inv.class, inv.name),
+                    });
+                }
+            });
+            fs
+        })
         .collect();
-    out.sort_by(|a, b| {
-        (&a.method, a.line, &a.callee).cmp(&(&b.method, b.line, &b.callee))
-    });
+    out.sort_by(|a, b| (&a.method, a.line, &a.callee).cmp(&(&b.method, b.line, &b.callee)));
     out
 }
 
@@ -126,87 +144,3 @@ fn is_binder_call(inv: &Invoke, ifaces: &HashSet<String>) -> bool {
     inv.kind == InvokeKind::Interface && ifaces.contains(&inv.class)
 }
 
-fn scan_method(m: &Method, ifaces: &HashSet<String>) -> Vec<Finding> {
-    let mut regs: HashMap<Reg, Lock> = HashMap::default();
-    if let Some(t) = m.this_reg() {
-        regs.insert(t, Lock::new(Root::This));
-        for j in 1..m.ins {
-            regs.insert(t + j, Lock::new(Root::Param(j)));
-        }
-    }
-
-    // No seeding for `synchronized` methods: d8/R8 lower them to explicit
-    // monitor-enter/exit over the body (the DEX flag is the informational
-    // `ACC_DECLARED_SYNCHRONIZED` 0x20000, not the runtime-enforced 0x20), so the
-    // implicit monitor is already tracked by the MonitorEnter arm below.
-    let mut held: Vec<Lock> = Vec::new();
-    let ground = |l: &Lock| l.ground(&m.class, &m.key());
-    // Only nameable (non-opaque) held locks: a `synchronized(param)` that doesn't
-    // resolve intra-procedurally grounds to an opaque, which we don't report on.
-    let names = |held: &[Lock]| -> Vec<String> {
-        held.iter().filter(|l| !l.is_opaque()).map(|l| l.name()).collect()
-    };
-
-    let mut out = Vec::new();
-    for insn in &m.insns {
-        match &insn.op {
-            Op::Iget { dst, class, field, .. } => {
-                regs.insert(*dst, Lock::field(Root::Recv(class.clone()), field.clone()));
-            }
-            Op::Sget { dst, class, field } => {
-                regs.insert(*dst, Lock::field(Root::Static(class.clone()), field.clone()));
-            }
-            Op::ConstClass { dst, class } => {
-                regs.insert(*dst, Lock::new(Root::ClassConst(class.clone())));
-            }
-            Op::Move { dst, src } => match regs.get(src).cloned() {
-                Some(v) => { regs.insert(*dst, v); }
-                None => { regs.remove(dst); }
-            },
-            Op::NewInstance { dst, .. } | Op::MoveResult { dst } => {
-                regs.remove(dst);
-            }
-            Op::MonitorEnter(r) => {
-                if let Some(l) = regs.get(r).cloned() {
-                    held.push(ground(&l));
-                }
-            }
-            Op::MonitorExit(r) => {
-                let name = regs.get(r).map(|l| ground(l).name());
-                match name.and_then(|n| held.iter().rposition(|h| h.name() == n)) {
-                    Some(pos) => { held.remove(pos); }
-                    None => { held.pop(); }
-                }
-            }
-            Op::Invoke(inv) => {
-                match juc::classify(&inv.class, &inv.name) {
-                    Some(LockCall::Acquire | LockCall::TryAcquire) => {
-                        if let Some(l) = inv.args.first().and_then(|r| regs.get(r)).cloned() {
-                            held.push(ground(&l));
-                        }
-                    }
-                    Some(LockCall::Release) => {
-                        if let Some(n) = inv.args.first().and_then(|r| regs.get(r)).map(|l| ground(l).name()) {
-                            if let Some(pos) = held.iter().rposition(|h| h.name() == n) {
-                                held.remove(pos);
-                            }
-                        }
-                    }
-                    _ => {
-                        if is_binder_call(inv, ifaces) && held.iter().any(|l| !l.is_opaque()) {
-                            out.push(Finding {
-                                method: m.key(),
-                                file: m.source_file.clone(),
-                                line: m.line_at(insn.offset),
-                                held: names(&held),
-                                callee: format!("{}.{}", inv.class, inv.name),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    out
-}

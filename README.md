@@ -283,9 +283,19 @@ lock(s) demonstrably held at the call and `callee` is the binder method invoked,
  "callee":"com.android.internal.telephony.IPhoneStateListener.onActiveDataSubIdChanged"}
 ```
 
-The pass is **intra-procedural**: it reports a lock held in the *same method* as the
-binder call, so it under-reports (it misses a lock held by a `…Locked` caller one
-frame up) rather than inventing findings — the opposite bias to a heuristic lint.
+The held-lock set is **interprocedural** for the common `…Locked` / `@GuardedBy`
+convention, where the lock is taken one frame up. A call in a *private* helper whose
+callers all hold a lock is still flagged: dexlock infers "locks held on entry" to
+each private method as the intersection of the held sets at all of its call sites,
+solved as a fixpoint over the call graph, and seeds the scan with it. Only private
+methods are inferred — their callers are all inside the analyzed DEX, so the
+intersection is over the *complete* set of callers; a public/package method could be
+called from outside with no lock held, so it is left unseeded rather than assumed
+(the analysis under-reports rather than inventing findings). This recovers real
+cases intra-procedural analysis misses — e.g. `UiAutomationConnection`'s
+`restoreRotationStateLocked()` calls `IWindowManager.freezeRotation` with `mLock`
+held by its caller (the AOSP source even comments that the call-out is deliberate).
+
 Two caveats it cannot resolve statically: a binder whose service lives in the *same*
 process (e.g. a system_server-internal AIDL) is a local call, not a real IPC; and a
 `oneway` call does not block. Both are still reported, so treat findings as "a lock

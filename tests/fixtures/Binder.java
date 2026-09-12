@@ -47,5 +47,18 @@ class Binder {
         }
 
         private void plain() {}
+
+        // POSITIVE (interprocedural): the binder call is in a private helper whose
+        // sole caller holds mLock, so the lock is one frame up. entry_held infers
+        // mLock on entry to helperLocked and the call is flagged there.
+        void callsHelper() {
+            synchronized (mLock) {
+                helperLocked();
+            }
+        }
+
+        private void helperLocked() {
+            mFoo.doRemote();
+        }
     }
 }
