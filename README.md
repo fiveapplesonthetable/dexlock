@@ -390,7 +390,11 @@ it a lock taken near the top of a service is "possibly held" in most of the
 program (60k methods for `mProcLock`, a 775-lock order cycle); ranked and bounded
 by distance, `mProcLock` has ~2.7k methods within 4 frames and the order graph is
 6.7k edges. The lock-order graph relates an acquisition only to locks held within
-`--order-depth` frames (default 3).
+`--order-depth` frames (default 3), and ignores a *reentrant* acquisition — a lock
+the method or a caller already holds orders nothing, and treating it as a fresh
+acquisition manufactures inversions out of nested `First → Second` blocks re-entered
+from a callee. On all 40 `system/framework` jars that filter takes the inversion list
+from 85 pairs to 18 (15 with no common outer lock), each backed by two witness sites.
 
 Limits: a callback reached only through a wide interface on a non-parameter
 receiver, or through reflection, is not linked, so lock context does not flow into

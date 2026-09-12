@@ -651,6 +651,11 @@ pub fn build(dex: &Dex, opts: &Options) -> Index {
     let mut edges: HashMap<(u32, u32), OrderEdge> = HashMap::default();
     for (m, r) in recs.iter().enumerate() {
         for s in &r.spans {
+            // Re-taking a lock already held (nested, or held on entry by a caller
+            // that took it earlier) orders nothing: skip the reentrant acquisition.
+            if s.held.contains(&s.lock) || dist[m].contains_key(&s.lock) {
+                continue;
+            }
             let mut froms: Vec<(u32, u8)> = s.held.iter().map(|&h| (h, 0)).collect();
             froms.extend(dist[m].iter().filter(|(_, &d)| d <= opts.order_depth).map(|(&l, &d)| (l, d)));
             for (y, d) in froms {
