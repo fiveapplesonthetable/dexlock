@@ -22,13 +22,25 @@
 //! *private* method as the intersection of the held sets at all of its call sites,
 //! solved as a monotone fixpoint over the call graph.
 //!
-//! Only private methods are inferred: a private method is callable only from within
-//! its own class, so every call site is inside the analyzed DEX and the intersection
-//! is over the *complete* set of callers. A public/protected/package method could be
-//! called from outside the analyzed artifacts with no lock held, so assuming a lock
-//! there would be unsound; those get an empty entry set. Instance-field locks are
-//! named per class (`Recv(C).f`), so a lock held in a caller carries its canonical
-//! name into a same-class callee with no per-object substitution needed.
+//! By default only private methods are inferred: a private method is callable only
+//! from within its own class, so every call site is inside the analyzed DEX and the
+//! intersection is over the *complete* set of callers. A public/protected/package
+//! method could be called from outside the analyzed artifacts with no lock held, so
+//! assuming a lock there would be unsound; those get an empty entry set.
+//!
+//! `closed_world` additionally infers any method whose exact `(name, sig)` is
+//! declared by *no other class* in the analyzed program. A globally-unique signature
+//! cannot be an override or a polymorphic target, so every `invoke-* U.name:sig`
+//! resolves to that one method regardless of the static receiver type `U` — the full
+//! caller set is exactly the call sites with that signature, with no class-hierarchy
+//! guessing. This recovers non-private `…Locked` helpers, but its soundness rests on
+//! the analyzed jars being the *whole* program: a caller in an omitted artifact would
+//! be missed and could turn the must-intersection into a false positive. Off by
+//! default; the caller asserts completeness by opting in.
+//!
+//! Instance-field locks are named per class (`Recv(C).f`), so a lock held in a caller
+//! carries its canonical name into a same-class callee with no per-object
+//! substitution needed.
 
 use crate::dex::juc::{self, LockCall};
 use crate::dex::model::*;
@@ -105,22 +117,51 @@ pub(super) fn scan<F: FnMut(&Invoke, &[Lock], Option<u32>)>(m: &Method, entry: &
     }
 }
 
-/// Locks held on entry to each private method, inferred interprocedurally. Keyed by
-/// method key; a method absent from the map (or mapping to an empty vec) has no
+/// Locks held on entry to each inferable method, computed interprocedurally. Keyed
+/// by method key; a method absent from the map (or mapping to an empty vec) has no
 /// inferred entry lock. Values are sorted by lock name so rounds compare cleanly.
-pub(super) fn entry_held(dex: &Dex) -> HashMap<String, Vec<Lock>> {
+/// With `closed_world`, methods with a globally-unique `(name, sig)` are inferred too
+/// (see the module docs for the soundness condition).
+pub(super) fn entry_held(dex: &Dex, closed_world: bool) -> HashMap<String, Vec<Lock>> {
     let methods: Vec<&Method> = dex.classes.iter().flat_map(|c| c.methods.iter()).collect();
-    // Eligible callees: private methods, whose every caller is in-class (visible).
-    let eligible: HashSet<String> =
+
+    // Exact-key callees: private methods, whose every caller is in-class (visible).
+    let eligible_exact: HashSet<String> =
         methods.iter().filter(|m| m.access & ACC_PRIVATE != 0).map(|m| m.key()).collect();
-    if eligible.is_empty() {
+
+    // Closed-world: methods whose `(name, sig)` is declared exactly once program-wide.
+    // Any `invoke-* U.name:sig` then resolves to this method whatever `U` is, so a
+    // call site is matched by signature, not by the static receiver class.
+    let mut sig_to_key: HashMap<String, String> = HashMap::default();
+    if closed_world {
+        let mut count: HashMap<String, u32> = HashMap::default();
+        for m in &methods {
+            let sig = format!("{}:{}", m.name, m.sig);
+            *count.entry(sig.clone()).or_default() += 1;
+            sig_to_key.insert(sig, m.key());
+        }
+        sig_to_key.retain(|sig, _| count.get(sig) == Some(&1));
+    }
+
+    if eligible_exact.is_empty() && sig_to_key.is_empty() {
         return HashMap::default();
     }
+    // Resolve a call site to the method key it feeds, if that method is inferable.
+    let target = |inv: &Invoke| -> Option<String> {
+        let ek = inv.key();
+        if eligible_exact.contains(&ek) {
+            return Some(ek);
+        }
+        if closed_world {
+            return sig_to_key.get(&format!("{}:{}", inv.name, inv.sig)).cloned();
+        }
+        None
+    };
 
     let mut entry: HashMap<String, Vec<Lock>> = HashMap::default();
     let empty: Vec<Lock> = Vec::new();
     for _round in 0..MAX_ROUNDS {
-        // Each method contributes, per call site targeting an eligible callee, the
+        // Each method contributes, per call site targeting an inferable callee, the
         // set of locks held there (seeded with the callee-independent current entry
         // set of the *calling* method).
         let per_method: Vec<Vec<(String, Vec<Lock>)>> = methods
@@ -129,8 +170,7 @@ pub(super) fn entry_held(dex: &Dex) -> HashMap<String, Vec<Lock>> {
                 let seed = entry.get(&m.key()).unwrap_or(&empty);
                 let mut out = Vec::new();
                 scan(m, seed, |inv, held, _line| {
-                    let k = inv.key();
-                    if eligible.contains(&k) {
+                    if let Some(k) = target(inv) {
                         out.push((k, held.to_vec()));
                     }
                 });

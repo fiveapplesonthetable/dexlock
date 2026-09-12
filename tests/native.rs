@@ -67,7 +67,7 @@ fn fixture_locks_resolve_natively() {
 fn fixture_binder_under_lock() {
     let bytes = include_bytes!("fixtures/binder.dex");
     let d = dex::parse_dex_blob(bytes).expect("parse fixture");
-    let mut got: Vec<(String, Vec<String>, String)> = dex::binder::binder_under_lock(&d)
+    let mut got: Vec<(String, Vec<String>, String)> = dex::binder::binder_under_lock(&d, false)
         .into_iter()
         .map(|f| {
             assert_eq!(f.file.as_deref(), Some("Binder.java"));

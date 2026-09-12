@@ -95,13 +95,13 @@ pub fn run(inputs: &[PathBuf], scope: Option<&str>, format: Format, out: &Path) 
 
 /// `dexlock binder`: analyze `inputs` and write every binder call made while a lock
 /// is held, as a JSON array. Returns the count.
-pub fn run_binder(inputs: &[PathBuf], scope: Option<&str>, out: &Path) -> Result<usize> {
+pub fn run_binder(inputs: &[PathBuf], scope: Option<&str>, closed_world: bool, out: &Path) -> Result<usize> {
     let t0 = Instant::now();
     let dex = input::parse_inputs(inputs, scope).context("parsing dex inputs")?;
     log::info!("parsed {} classes in {:.2?}", dex.classes.len(), t0.elapsed());
 
     let t1 = Instant::now();
-    let findings = dex::binder::binder_under_lock(&dex);
+    let findings = dex::binder::binder_under_lock(&dex, closed_world);
     log::info!("found {} binder-under-lock sites in {:.2?}", findings.len(), t1.elapsed());
 
     #[derive(serde::Serialize)]

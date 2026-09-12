@@ -42,11 +42,12 @@ pub struct Finding {
 
 /// Find every binder call made while a lock is held. Held locks include those taken
 /// intra-procedurally (monitor / `Lock.lock`) and those inferred to be held on entry
-/// to a private method by [`flow::entry_held`], so a call in a `…Locked` helper whose
-/// lock is taken one frame up is still caught.
-pub fn binder_under_lock(dex: &Dex) -> Vec<Finding> {
+/// to a method by [`flow::entry_held`], so a call in a `…Locked` helper whose lock is
+/// taken one frame up is still caught. `closed_world` widens that inference past
+/// private methods to any uniquely-signed one (see [`flow::entry_held`]).
+pub fn binder_under_lock(dex: &Dex, closed_world: bool) -> Vec<Finding> {
     let ifaces = binder_interfaces(dex);
-    let entry = flow::entry_held(dex);
+    let entry = flow::entry_held(dex, closed_world);
     let empty: Vec<Lock> = Vec::new();
     let mut out: Vec<Finding> = dex
         .classes

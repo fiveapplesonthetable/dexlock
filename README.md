@@ -262,6 +262,7 @@ that wants the lock is stuck behind it — a common ANR and lock-inversion sourc
 
 ```sh
 dexlock binder services.jar framework.jar -o binder.json
+# --closed-world  infer caller-held locks past private methods (see below)
 # --scope <substr> narrows a directory input; --dexdump <path> selects the back-end
 ```
 
@@ -295,6 +296,19 @@ called from outside with no lock held, so it is left unseeded rather than assume
 cases intra-procedural analysis misses — e.g. `UiAutomationConnection`'s
 `restoreRotationStateLocked()` calls `IWindowManager.freezeRotation` with `mLock`
 held by its caller (the AOSP source even comments that the call-out is deliberate).
+
+**`--closed-world`** widens the inference: it treats the given inputs as the whole
+program and infers caller-held locks for any method whose exact `(name, sig)` is
+declared by no other class. A globally-unique signature cannot be an override or a
+polymorphic target, so every call site with that signature resolves to that one
+method — the full caller set is known without class-hierarchy guessing. This recovers
+non-private `…Locked` helpers, singleton constructors called under a class lock, and
+calls that reach a private method through a synthetic accessor bridge (which has a
+unique signature). Its soundness rests on the inputs being complete: pass *all*
+relevant jars/apks, because a caller in an omitted artifact would be missed and could
+turn the must-intersection into a false positive. On `services.jar` + `framework.jar`
+it lifts the count from 693 to 833. It is off by default; the default (private-only)
+inference needs no whole-program assumption.
 
 Two caveats it cannot resolve statically: a binder whose service lives in the *same*
 process (e.g. a system_server-internal AIDL) is a local call, not a real IPC; and a

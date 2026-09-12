@@ -126,6 +126,13 @@ struct BinderArgs {
     #[arg(long, short = 'o', default_value = "dexlock_binder.json")]
     output: PathBuf,
 
+    /// Assume the inputs are the whole program: infer caller-held locks for any
+    /// uniquely-signed method, not just private ones. Only sound if every caller is
+    /// present in the inputs (pass all relevant jars/apks); a missing caller can turn
+    /// an inferred lock into a false positive.
+    #[arg(long)]
+    closed_world: bool,
+
     /// Use the `dexdump` back-end instead of the native reader (path to dexdump;
     /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
@@ -217,7 +224,7 @@ fn run_binder(args: BinderArgs) -> Result<()> {
         std::env::set_var("DEXLOCK_DEXDUMP", d);
         std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
     }
-    let n = dump::run_binder(&args.inputs, args.scope.as_deref(), &args.output)?;
+    let n = dump::run_binder(&args.inputs, args.scope.as_deref(), args.closed_world, &args.output)?;
     println!("Wrote {n} binder-under-lock findings to {}", args.output.display());
     Ok(())
 }
