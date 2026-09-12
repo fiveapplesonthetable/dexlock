@@ -260,8 +260,13 @@ compact index layouts — what `mkfs.erofs` produces for Android) or **ext4** re
 `deapexer`, `debugfs` or `fsck.erofs` subprocess is needed. If a payload uses a
 feature the native readers do not cover, `deapexer` is used as a fallback (found via
 `$DEXLOCK_DEAPEXER`, then `PATH`; its helpers via `$DEXLOCK_DEBUGFS` /
-`$DEXLOCK_FSCK_EROFS`, then beside `deapexer`). The native reader is verified
-byte-for-byte against `deapexer` on every APEX of an AOSP build (61 jars). With
+`$DEXLOCK_FSCK_EROFS`, then beside `deapexer`). Passing `--deapexer <path>` (or
+setting `$DEXLOCK_USE_DEAPEXER`) selects that tool outright instead of the native
+readers — the same relationship `--dexdump` has to the native DEX reader, and how
+the two are cross-checked. The native reader is verified byte-for-byte against
+`deapexer` on every APEX of an AOSP build (61 jars), and `dump` over
+`system/apex` produces identical output either way (7,511 lock points), the
+native path in 6.6 s against 15.4 s. With
 `system/framework` and `system/apex` both given, the whole system_server class
 space is in: 95,923 classes, 2.68M call sites, 99.94% of them linked, 0.06% into
 classes outside the inputs.

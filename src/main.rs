@@ -79,6 +79,11 @@ struct RaceArgs {
     /// Use the `dexdump` back-end instead of the native reader.
     #[arg(long)]
     dexdump: Option<PathBuf>,
+    /// Use the `deapexer` host tool to unpack APEX payloads instead of the native
+    /// EROFS/ext4 readers (path to deapexer; else `$DEXLOCK_DEAPEXER`, else `PATH`).
+    /// Without this the native readers are used, with `deapexer` as a fallback.
+    #[arg(long)]
+    deapexer: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -126,6 +131,11 @@ struct CtxBuildArgs {
     /// Use the `dexdump` back-end instead of the native reader.
     #[arg(long)]
     dexdump: Option<PathBuf>,
+    /// Use the `deapexer` host tool to unpack APEX payloads instead of the native
+    /// EROFS/ext4 readers (path to deapexer; else `$DEXLOCK_DEAPEXER`, else `PATH`).
+    /// Without this the native readers are used, with `deapexer` as a fallback.
+    #[arg(long)]
+    deapexer: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -207,6 +217,11 @@ struct ResolveArgs {
     /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
+    /// Use the `deapexer` host tool to unpack APEX payloads instead of the native
+    /// EROFS/ext4 readers (path to deapexer; else `$DEXLOCK_DEAPEXER`, else `PATH`).
+    /// Without this the native readers are used, with `deapexer` as a fallback.
+    #[arg(long)]
+    deapexer: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -232,6 +247,11 @@ struct DumpArgs {
     /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
+    /// Use the `deapexer` host tool to unpack APEX payloads instead of the native
+    /// EROFS/ext4 readers (path to deapexer; else `$DEXLOCK_DEAPEXER`, else `PATH`).
+    /// Without this the native readers are used, with `deapexer` as a fallback.
+    #[arg(long)]
+    deapexer: Option<PathBuf>,
 }
 
 #[derive(Parser, Debug)]
@@ -260,12 +280,31 @@ struct BinderArgs {
     /// else `$DEXLOCK_DEXDUMP`, else `PATH`).
     #[arg(long)]
     dexdump: Option<PathBuf>,
+    /// Use the `deapexer` host tool to unpack APEX payloads instead of the native
+    /// EROFS/ext4 readers (path to deapexer; else `$DEXLOCK_DEAPEXER`, else `PATH`).
+    /// Without this the native readers are used, with `deapexer` as a fallback.
+    #[arg(long)]
+    deapexer: Option<PathBuf>,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
 enum Fmt {
     Json,
     Proto,
+}
+
+/// Select the subprocess back-ends: `--dexdump` parses DEX with `dexdump` instead
+/// of the native reader, `--deapexer` unpacks APEX payloads with `deapexer` instead
+/// of the native EROFS/ext4 readers. Each also gives the binary's path.
+fn select_backends(dexdump: Option<&PathBuf>, deapexer: Option<&PathBuf>) {
+    if let Some(d) = dexdump {
+        std::env::set_var("DEXLOCK_DEXDUMP", d);
+        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
+    }
+    if let Some(d) = deapexer {
+        std::env::set_var("DEXLOCK_DEAPEXER", d);
+        std::env::set_var("DEXLOCK_USE_DEAPEXER", "1");
+    }
 }
 
 fn main() -> Result<()> {
@@ -291,10 +330,7 @@ fn main() -> Result<()> {
 }
 
 fn run_race(args: RaceArgs) -> Result<()> {
-    if let Some(d) = &args.dexdump {
-        std::env::set_var("DEXLOCK_DEXDUMP", d);
-        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-    }
+    select_backends(args.dexdump.as_ref(), args.deapexer.as_ref());
     let opts = dexlock::dex::race::Options {
         min_guarded: args.min_guarded,
         min_ratio: args.min_ratio,
@@ -308,10 +344,7 @@ fn run_race(args: RaceArgs) -> Result<()> {
 fn run_ctx(args: CtxArgs) -> Result<()> {
     match args.cmd {
         CtxCmd::Build(a) => {
-            if let Some(d) = &a.dexdump {
-                std::env::set_var("DEXLOCK_DEXDUMP", d);
-                std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-            }
+            select_backends(a.dexdump.as_ref(), a.deapexer.as_ref());
             let opts = dexlock::dex::ctx::Options { cha_cap: a.cha_cap, max_depth: a.max_depth, order_depth: a.order_depth };
             let idx = lockctx::build(&a.inputs, a.scope.as_deref(), &opts, &a.output)?;
             println!(
@@ -366,11 +399,7 @@ fn run_ctx(args: CtxArgs) -> Result<()> {
 }
 
 fn run_resolve(args: ResolveArgs) -> Result<()> {
-    if let Some(d) = &args.dexdump {
-        // Passing --dexdump selects the dexdump back-end (and points at the binary).
-        std::env::set_var("DEXLOCK_DEXDUMP", d);
-        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-    }
+    select_backends(args.dexdump.as_ref(), args.deapexer.as_ref());
 
     let rows = CsvTraceSource { path: args.input.clone() }.fetch(&Query::default())?;
     let table = dexlock::csv_io::load(&args.input)?; // headers for round-tripping columns
@@ -404,11 +433,7 @@ fn run_resolve(args: ResolveArgs) -> Result<()> {
 }
 
 fn run_dump(args: DumpArgs) -> Result<()> {
-    if let Some(d) = &args.dexdump {
-        // Passing --dexdump selects the dexdump back-end (and points at the binary).
-        std::env::set_var("DEXLOCK_DEXDUMP", d);
-        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-    }
+    select_backends(args.dexdump.as_ref(), args.deapexer.as_ref());
     let format = match args.format {
         Fmt::Json => Format::Json,
         Fmt::Proto => Format::Proto,
@@ -419,11 +444,7 @@ fn run_dump(args: DumpArgs) -> Result<()> {
 }
 
 fn run_binder(args: BinderArgs) -> Result<()> {
-    if let Some(d) = &args.dexdump {
-        // Passing --dexdump selects the dexdump back-end (and points at the binary).
-        std::env::set_var("DEXLOCK_DEXDUMP", d);
-        std::env::set_var("DEXLOCK_USE_DEXDUMP", "1");
-    }
+    select_backends(args.dexdump.as_ref(), args.deapexer.as_ref());
     let n = dump::run_binder(&args.inputs, args.scope.as_deref(), args.closed_world, &args.output)?;
     println!("Wrote {n} binder-under-lock findings to {}", args.output.display());
     Ok(())

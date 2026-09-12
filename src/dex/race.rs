@@ -20,7 +20,7 @@
 //!
 //! 1. **Lock `L` is held at these accesses.** A *must* set: taken in the accessing
 //!    method, or held on entry to a private helper by every one of its callers
-//!    ([`flow::entry_held`]). What is reported is what the bytecode does.
+//!    (`flow::entry_held`). What is reported is what the bytecode does.
 //! 2. **This write holds nothing, on any path.** A *may* set: the write's method has
 //!    no lock on entry from any caller within [`ctx::Options::max_depth`] frames
 //!    ([`ctx::Index::may_held`]), and takes none itself before the write. This is

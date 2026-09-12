@@ -18,9 +18,10 @@
 //! Everything happens in memory: the zip is opened from bytes, `apex_payload.img`
 //! is read out, and an in-process EROFS or ext4 reader walks the image to
 //! `/javalib`. If the payload uses a feature the native readers do not cover, the
-//! `deapexer` host tool is used instead (found via `$DEXLOCK_DEAPEXER`, then
-//! `PATH`; its `debugfs`/`fsck.erofs` helpers via `$DEXLOCK_DEBUGFS` /
-//! `$DEXLOCK_FSCK_EROFS`, then beside `deapexer`, then `PATH`).
+//! `deapexer` host tool is used instead; setting `$DEXLOCK_USE_DEAPEXER` selects it
+//! outright, which is how the two are cross-checked. It is found via
+//! `$DEXLOCK_DEAPEXER`, then `PATH`; its `debugfs`/`fsck.erofs` helpers via
+//! `$DEXLOCK_DEBUGFS` / `$DEXLOCK_FSCK_EROFS`, then beside `deapexer`, then `PATH`.
 
 mod erofs;
 mod ext4;
@@ -44,9 +45,13 @@ pub fn javalib_jars(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
     jars_in_image(&img)
 }
 
-/// Like [`javalib_jars`], falling back to `deapexer` on the on-disk `path` when
-/// the native readers cannot handle the payload.
+/// Like [`javalib_jars`], falling back to `deapexer` on the on-disk `path` when the
+/// native readers cannot handle the payload — or using it outright when
+/// `$DEXLOCK_USE_DEAPEXER` is set.
 pub fn javalib_jars_at(path: &Path, bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>> {
+    if std::env::var_os("DEXLOCK_USE_DEAPEXER").is_some() {
+        return deapexer(path).with_context(|| format!("{}: deapexer", path.display()));
+    }
     match javalib_jars(bytes) {
         Ok(jars) => Ok(jars),
         Err(native) => {
